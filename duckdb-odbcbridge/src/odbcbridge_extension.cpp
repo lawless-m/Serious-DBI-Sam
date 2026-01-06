@@ -27,6 +27,9 @@ static void LoadInternal(DatabaseInstance &instance) {
     RegisterDbiasmTablesFunction(instance);
     RegisterDbiasmDescribeFunction(instance);
     RegisterDbiasmQueryFunction(instance);
+
+    // Register DBISAM catalog
+    RegisterDbiasmCatalog(instance);
 }
 
 void OdbcbridgeExtension::Load(DuckDB &db) {

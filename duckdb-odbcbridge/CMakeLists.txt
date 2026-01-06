@@ -73,6 +73,7 @@ set(EXTENSION_SOURCES
     src/grpc_client.cpp
     src/table_functions.cpp
     src/type_mapping.cpp
+    src/dbisam_catalog.cpp
 )
 
 # Include DuckDB

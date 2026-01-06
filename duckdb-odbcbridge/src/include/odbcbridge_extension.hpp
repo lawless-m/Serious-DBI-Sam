@@ -15,4 +15,7 @@ void RegisterDbiasmTablesFunction(DatabaseInstance &db);
 void RegisterDbiasmDescribeFunction(DatabaseInstance &db);
 void RegisterDbiasmQueryFunction(DatabaseInstance &db);
 
+// Catalog registration
+void RegisterDbiasmCatalog(DatabaseInstance &db);
+
 } // namespace duckdb
