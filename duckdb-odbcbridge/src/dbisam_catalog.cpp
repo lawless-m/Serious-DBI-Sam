@@ -316,8 +316,9 @@ void RegisterDbiasmCatalog(DatabaseInstance &db) {
     // Get connection configuration
     std::string host = "localhost";
     int port = 50051;
+    std::string catalog_name = "dbisam";
 
-    Value host_value, port_value;
+    Value host_value, port_value, catalog_name_value;
     if (config.options.default_extension_options.find("odbcbridge_host") != config.options.default_extension_options.end()) {
         host_value = config.options.default_extension_options["odbcbridge_host"];
         host = host_value.GetValue<std::string>();
@@ -328,12 +329,17 @@ void RegisterDbiasmCatalog(DatabaseInstance &db) {
         port = port_value.GetValue<int32_t>();
     }
 
+    if (config.options.default_extension_options.find("odbcbridge_catalog_name") != config.options.default_extension_options.end()) {
+        catalog_name_value = config.options.default_extension_options["odbcbridge_catalog_name"];
+        catalog_name = catalog_name_value.GetValue<std::string>();
+    }
+
     // Attach the DBISAM catalog
     auto &catalog_manager = Catalog::GetSystemCatalog(db);
 
     // Create attach info
     AttachInfo attach_info;
-    attach_info.name = "dbisam";
+    attach_info.name = catalog_name;
     attach_info.options["type"] = Value("dbisam");
 
     // Create the catalog

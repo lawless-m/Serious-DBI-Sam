@@ -27,6 +27,7 @@ SELECT * FROM dbisam_query('SELECT * FROM tablename', 1000);
 ```sql
 SET odbcbridge_host = '192.168.1.100';
 SET odbcbridge_port = 50051;
+SET odbcbridge_catalog_name = 'em';  -- Optional: customize catalog name (default: 'dbisam')
 ```
 
 ## Building
@@ -55,6 +56,8 @@ make debug
 
 ## Usage
 
+### Table Functions
+
 ```sql
 -- Load extension
 LOAD 'path/to/odbcbridge.duckdb_extension';
@@ -63,9 +66,35 @@ LOAD 'path/to/odbcbridge.duckdb_extension';
 SET odbcbridge_host = '192.168.1.100';
 SET odbcbridge_port = 50051;
 
--- Query data
+-- Query data using table functions
 SELECT * FROM dbisam_tables();
 SELECT * FROM dbisam_query('SELECT * FROM customers WHERE active = 1');
+```
+
+### Virtual Tables (Direct SQL Access)
+
+```sql
+-- Load extension
+LOAD 'path/to/odbcbridge.duckdb_extension';
+
+-- Configure connection
+SET odbcbridge_host = '192.168.1.100';
+SET odbcbridge_port = 50051;
+SET odbcbridge_catalog_name = 'em';  -- Optional: use 'em' instead of 'dbisam'
+
+-- Query tables directly!
+SELECT * FROM em.products WHERE price > 100;
+SELECT * FROM em.customers LIMIT 10;
+
+-- Join remote tables
+SELECT p.name, c.company_name
+FROM em.products p
+JOIN em.customers c ON p.customer_id = c.id;
+
+-- Mix with local DuckDB tables
+SELECT local.*, remote.status
+FROM local_table local
+LEFT JOIN em.orders remote ON local.order_id = remote.id;
 ```
 
 ## Requirements
