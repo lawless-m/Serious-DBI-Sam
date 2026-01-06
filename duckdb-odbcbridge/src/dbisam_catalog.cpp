@@ -9,13 +9,168 @@
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/common/string_util.hpp"
 
 namespace duckdb {
+
+// ============================================
+// Filter Pushdown Helpers
+// ============================================
+
+static std::string ValueToSQL(const Value &val) {
+    if (val.IsNull()) {
+        return "NULL";
+    }
+
+    switch (val.type().id()) {
+        case LogicalTypeId::BOOLEAN:
+            return val.GetValue<bool>() ? "1" : "0";
+        case LogicalTypeId::TINYINT:
+        case LogicalTypeId::SMALLINT:
+        case LogicalTypeId::INTEGER:
+        case LogicalTypeId::BIGINT:
+            return val.ToString();
+        case LogicalTypeId::FLOAT:
+        case LogicalTypeId::DOUBLE:
+        case LogicalTypeId::DECIMAL:
+            return val.ToString();
+        case LogicalTypeId::VARCHAR:
+            // Escape single quotes
+            {
+                auto str = val.ToString();
+                std::string escaped;
+                escaped.reserve(str.length() + 2);
+                for (char c : str) {
+                    if (c == '\'') {
+                        escaped += "''";
+                    } else {
+                        escaped += c;
+                    }
+                }
+                return "'" + escaped + "'";
+            }
+        case LogicalTypeId::DATE:
+        case LogicalTypeId::TIMESTAMP:
+            return "'" + val.ToString() + "'";
+        default:
+            return "'" + val.ToString() + "'";
+    }
+}
+
+static bool TryConvertFilter(const TableFilter &filter, const string &column_name,
+                             string &sql_filter, ClientContext &context, bool &warning_issued) {
+    switch (filter.filter_type) {
+        case TableFilterType::CONSTANT_COMPARISON: {
+            auto &const_filter = filter.Cast<ConstantFilter>();
+            string op;
+            switch (const_filter.comparison_type) {
+                case ExpressionType::COMPARE_EQUAL:
+                    op = "=";
+                    break;
+                case ExpressionType::COMPARE_NOTEQUAL:
+                    op = "!=";
+                    break;
+                case ExpressionType::COMPARE_LESSTHAN:
+                    op = "<";
+                    break;
+                case ExpressionType::COMPARE_GREATERTHAN:
+                    op = ">";
+                    break;
+                case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+                    op = "<=";
+                    break;
+                case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+                    op = ">=";
+                    break;
+                default:
+                    if (!warning_issued) {
+                        context.Explain(StringUtil::Format(
+                            "WARNING: Filter on '%s' cannot be pushed down to DBISAM (unsupported comparison type). "
+                            "This will fetch all rows and filter locally, which may be slow.",
+                            column_name));
+                        warning_issued = true;
+                    }
+                    return false;
+            }
+            sql_filter = column_name + " " + op + " " + ValueToSQL(const_filter.constant);
+            return true;
+        }
+
+        case TableFilterType::IS_NULL:
+            sql_filter = column_name + " IS NULL";
+            return true;
+
+        case TableFilterType::IS_NOT_NULL:
+            sql_filter = column_name + " IS NOT NULL";
+            return true;
+
+        case TableFilterType::CONJUNCTION_AND: {
+            auto &conj_filter = filter.Cast<ConjunctionAndFilter>();
+            vector<string> conditions;
+            for (auto &child_filter : conj_filter.child_filters) {
+                string child_sql;
+                if (TryConvertFilter(*child_filter, column_name, child_sql, context, warning_issued)) {
+                    conditions.push_back(child_sql);
+                } else {
+                    return false;
+                }
+            }
+            if (conditions.empty()) {
+                return false;
+            }
+            sql_filter = "(" + StringUtil::Join(conditions, " AND ") + ")";
+            return true;
+        }
+
+        case TableFilterType::CONJUNCTION_OR: {
+            auto &conj_filter = filter.Cast<ConjunctionOrFilter>();
+            vector<string> conditions;
+            for (auto &child_filter : conj_filter.child_filters) {
+                string child_sql;
+                if (TryConvertFilter(*child_filter, column_name, child_sql, context, warning_issued)) {
+                    conditions.push_back(child_sql);
+                } else {
+                    // If any OR condition can't be pushed, we can't push the whole OR
+                    if (!warning_issued) {
+                        context.Explain(StringUtil::Format(
+                            "WARNING: Complex OR filter on '%s' cannot be fully pushed down to DBISAM. "
+                            "This will fetch all rows and filter locally, which may be slow.",
+                            column_name));
+                        warning_issued = true;
+                    }
+                    return false;
+                }
+            }
+            if (conditions.empty()) {
+                return false;
+            }
+            sql_filter = "(" + StringUtil::Join(conditions, " OR ") + ")";
+            return true;
+        }
+
+        default:
+            if (!warning_issued) {
+                context.Explain(StringUtil::Format(
+                    "WARNING: Filter on '%s' (type: %s) cannot be pushed down to DBISAM. "
+                    "This will fetch all rows and filter locally, which may be slow. "
+                    "Consider using simple comparisons (=, !=, <, >, <=, >=) for better performance.",
+                    column_name, TableFilterTypeToString(filter.filter_type)));
+                warning_issued = true;
+            }
+            return false;
+    }
+}
 
 // ============================================
 // DBISAM Table Scan Function
@@ -31,6 +186,7 @@ struct DbiasmScanBindData : public TableFunctionData {
     // Filter pushdown
     std::string filter_sql;
     std::optional<int32_t> limit;
+    bool has_unpushed_filters = false;
 };
 
 struct DbiasmScanGlobalState : public GlobalTableFunctionState {
@@ -114,8 +270,82 @@ static void DbiasmScanFunc(ClientContext &context, TableFunctionInput &data, Dat
     output.SetCardinality(count);
 }
 
+static void DbiasmScanPushdownFilter(ClientContext &context, optional_ptr<FunctionData> bind_data_p,
+                                     vector<unique_ptr<Expression>> &filters) {
+    auto &bind_data = bind_data_p->Cast<DbiasmScanBindData>();
+    vector<string> pushed_filters;
+    bool warning_issued = false;
+
+    // Try to push down each filter
+    for (idx_t i = 0; i < filters.size();) {
+        auto &filter = filters[i];
+
+        // Only handle simple column references with table filters
+        if (filter->type == ExpressionType::BOUND_COLUMN_REF) {
+            auto &col_ref = filter->Cast<BoundColumnRefExpression>();
+            idx_t col_idx = col_ref.binding.column_index;
+
+            if (col_idx < bind_data.column_names.size()) {
+                // This is a placeholder - actual filter logic happens in table filter pushdown
+                // Just track that we have filters
+                bind_data.has_unpushed_filters = true;
+            }
+        }
+        i++;
+    }
+}
+
+static unique_ptr<NodeStatistics> DbiasmScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+    // We don't know the cardinality without executing the query
+    return make_uniq<NodeStatistics>();
+}
+
+static void DbiasmScanPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData &bind_data_p,
+                                            vector<unique_ptr<Expression>> &filters) {
+    auto &bind_data = bind_data_p.Cast<DbiasmScanBindData>();
+    vector<string> pushed_conditions;
+    bool warning_issued = false;
+
+    // Process table filters (simpler filters that DuckDB pre-processes)
+    if (!get.table_filters.filters.empty()) {
+        for (auto &entry : get.table_filters.filters) {
+            idx_t col_idx = entry.first;
+            auto &filter = *entry.second;
+
+            if (col_idx < bind_data.column_names.size()) {
+                string sql_filter;
+                if (TryConvertFilter(filter, bind_data.column_names[col_idx], sql_filter, context, warning_issued)) {
+                    pushed_conditions.push_back(sql_filter);
+                } else {
+                    bind_data.has_unpushed_filters = true;
+                }
+            }
+        }
+    }
+
+    // Combine all pushed conditions
+    if (!pushed_conditions.empty()) {
+        bind_data.filter_sql = StringUtil::Join(pushed_conditions, " AND ");
+
+        // Show info about successful pushdown
+        context.Explain(StringUtil::Format(
+            "INFO: Pushed filter to DBISAM: %s", bind_data.filter_sql));
+    } else if (bind_data.has_unpushed_filters) {
+        // We have filters but couldn't push any
+        if (!warning_issued) {
+            context.Explain(
+                "WARNING: No filters could be pushed down to DBISAM. "
+                "All data will be fetched and filtered locally. "
+                "For better performance, use simple comparisons (=, !=, <, >, <=, >=, IS NULL, IS NOT NULL).");
+        }
+    }
+}
+
 static TableFunction GetDbiasmScanFunction() {
     TableFunction func("dbisam_scan", {}, DbiasmScanFunc, DbiasmScanBind, DbiasmScanInit);
+    func.filter_pushdown = true;
+    func.pushdown_complex_filter = DbiasmScanPushdownComplexFilter;
+    func.cardinality = DbiasmScanCardinality;
     return func;
 }
 

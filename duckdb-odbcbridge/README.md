@@ -73,6 +73,8 @@ SELECT * FROM dbisam_query('SELECT * FROM customers WHERE active = 1');
 
 ### Virtual Tables (Direct SQL Access)
 
+The virtual table system automatically pushes filters down to DBISAM for better performance.
+
 ```sql
 -- Load extension
 LOAD 'path/to/odbcbridge.duckdb_extension';
@@ -82,9 +84,12 @@ SET odbcbridge_host = '192.168.1.100';
 SET odbcbridge_port = 50051;
 SET odbcbridge_catalog_name = 'em';  -- Optional: use 'em' instead of 'dbisam'
 
--- Query tables directly!
-SELECT * FROM em.products WHERE price > 100;
-SELECT * FROM em.customers LIMIT 10;
+-- Query tables directly with filter pushdown!
+SELECT * FROM em.products WHERE price > 100 AND active = 1;
+-- ✅ Pushed to DBISAM: Only matching rows transferred
+
+SELECT * FROM em.customers WHERE created_date >= '2024-01-01';
+-- ✅ Pushed to DBISAM: Efficient date filtering
 
 -- Join remote tables
 SELECT p.name, c.company_name
@@ -96,6 +101,14 @@ SELECT local.*, remote.status
 FROM local_table local
 LEFT JOIN em.orders remote ON local.order_id = remote.id;
 ```
+
+**Filter Pushdown Support:**
+- ✅ Comparisons: `=`, `!=`, `<`, `>`, `<=`, `>=`
+- ✅ NULL checks: `IS NULL`, `IS NOT NULL`
+- ✅ Logic: `AND`, `OR` combinations
+- ⚠️ Not pushed: `LIKE`, `IN`, `BETWEEN` (you'll see a warning)
+
+When filters can't be pushed down, DuckDB will show a warning and fetch all rows for local filtering.
 
 ## Requirements
 
