@@ -1,69 +1,91 @@
-# Claude Code Template
+# Serious DBI Sam
 
-![Spellbook](spellbook.png)
+ODBC Bridge for DuckDB - A DuckDB extension that queries remote ODBC data sources via a Windows service.
 
-A GitHub template repository containing reusable Claude Code skills and commands.
+## Purpose
 
-## Usage
+Access legacy Windows-only ODBC data sources (specifically DBISAM) from DuckDB running on Linux, without dealing with WAL/locking issues of direct file access.
 
-### Creating a New Project
-
-1. Click **"Use this template"** on GitHub
-2. Create your new repository
-3. Your project automatically includes:
-   - Skills in `.claude/skills/`
-   - Commands in `.claude/commands/`
-
-### Available Commands
-
-| Command | Description |
-|---------|-------------|
-| `/commit` | Create a well-crafted git commit with conventional format |
-| `/publish` | Run `dotnet publish -c release` |
-| `/push` | Commit pending changes and push to remote |
-
-### Available Skills
-
-| Skill | Description |
-|-------|-------------|
-| **BrowserBridge** | Real-time browser debugging via WebSocket bridge |
-| **Creating Skills** | Guide for creating new skill documents |
-| **CSharpener** | C# static analysis for call graphs and unused code |
-| **Databases** | RDBMS patterns for DuckDB, MySQL, PostgreSQL, SQL Server |
-| **Dotnet 8 to 9** | .NET migration guide |
-| **Elasticsearch** | ES 5.2 operations - search, bulk, scroll, aliases |
-| **Email** | Email handling patterns |
-| **Image Files** | ImageMagick command-line operations |
-| **JSharpener** | JavaScript/TypeScript static analysis |
-| **Logging** | UTF-8 file logging with date-based filenames |
-| **Parquet Files** | Creating Parquet files in C# |
-| **PythonJson** | Python JSON I/O patterns |
-| **Rust** | Rust development patterns and project setup |
-| **SharePoint** | SharePoint integration |
-| **Web Frontend** | React + Tailwind + shadcn/ui artifacts |
-
-## Structure
+## Architecture
 
 ```
-your-project/
-├── .claude/
-│   ├── commands/
-│   │   ├── commit.md
-│   │   ├── publish.md
-│   │   └── push.md
-│   └── skills/
-│       ├── Databases/
-│       ├── Elasticsearch/
-│       └── ...
-├── README.md
-└── spellbook.png
+┌─────────────────────┐         gRPC          ┌─────────────────────┐
+│  Linux              │                       │  Windows            │
+│                     │                       │                     │
+│  DuckDB             │                       │  ODBC Bridge        │
+│    └─ Extension ────┼───────────────────────┼──► Service          │
+│       (C++)         │      TCP/50051        │       │             │
+│                     │                       │       ▼             │
+└─────────────────────┘                       │     ODBC            │
+                                              │       │             │
+                                              │       ▼             │
+                                              │    DBISAM           │
+                                              └─────────────────────┘
 ```
 
-## How Skills Work
+## Components
 
-Skills are markdown files that teach Claude domain-specific patterns. They're loaded automatically when relevant or can be explicitly invoked.
+This repository contains three main components:
 
-## Source
+1. **duckdb-odbcbridge/** - DuckDB C++ extension
+2. **OdbcBridge.Service/** - Windows C# gRPC service
+3. **odbcbridge/** - Documentation and specifications
 
-This template is maintained at:
-- https://github.com/lawless-m/claude-skills
+## Quick Start
+
+### DuckDB Usage
+
+```sql
+-- Configure the bridge
+SET odbcbridge_host = '192.168.1.100';
+SET odbcbridge_port = 50051;
+
+-- List available tables
+SELECT * FROM dbisam_tables();
+
+-- Show table schema
+SELECT * FROM dbisam_describe('tablename');
+
+-- Execute a query
+SELECT * FROM dbisam_query('SELECT * FROM tablename');
+
+-- Execute with row limit
+SELECT * FROM dbisam_query('SELECT * FROM tablename', 1000);
+```
+
+## Documentation
+
+For detailed information, see the [odbcbridge documentation](odbcbridge/CONTENTS.md):
+
+- [CONTENTS.md](odbcbridge/CONTENTS.md) - Project overview and quick reference
+- [PROTOCOL.md](odbcbridge/PROTOCOL.md) - gRPC/Protobuf protocol definition and type mappings
+- [SERVICE.md](odbcbridge/SERVICE.md) - Windows C# service implementation details
+- [EXTENSION.md](odbcbridge/EXTENSION.md) - DuckDB C++ extension implementation details
+- [BUILD.md](odbcbridge/BUILD.md) - Build instructions for both components
+
+## Features
+
+- ✅ Single configured DSN
+- ✅ List tables
+- ✅ Describe tables
+- ✅ Execute queries with optional limit
+- ✅ Streaming results for large datasets
+
+## Scope
+
+This is intentionally minimal. The following are **not** supported:
+
+- ❌ Multiple DSNs
+- ❌ Authentication
+- ❌ Write operations
+- ❌ Transactions
+
+## Tech Stack
+
+- **Service**: C# / .NET 8 / gRPC / System.Data.Odbc
+- **Extension**: C++ / DuckDB Extension API / gRPC
+- **Protocol**: Protocol Buffers 3
+
+## License
+
+[Specify your license here]
