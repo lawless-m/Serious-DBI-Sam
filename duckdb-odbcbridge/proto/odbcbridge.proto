@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package odbcbridge;
+
+option csharp_namespace = "OdbcBridge";
+
+// The ODBC Bridge service
+service OdbcBridge {
+  // List all tables in the configured DSN
+  rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+
+  // Describe a table's schema
+  rpc DescribeTable(DescribeTableRequest) returns (DescribeTableResponse);
+
+  // Execute a query and stream results
+  rpc Query(QueryRequest) returns (stream QueryResponse);
+}
+
+// Empty request - the DSN is configured server-side
+message ListTablesRequest {}
+
+message ListTablesResponse {
+  repeated string table_names = 1;
+}
+
+message DescribeTableRequest {
+  string table_name = 1;
+}
+
+message ColumnInfo {
+  string name = 1;
+  string type_name = 2;      // ODBC type name (e.g., "VARCHAR", "INTEGER")
+  int32 odbc_type = 3;       // ODBC SQL type constant
+  int32 size = 4;            // Column size
+  int32 decimal_digits = 5;  // For numeric types
+  bool nullable = 6;
+}
+
+message DescribeTableResponse {
+  string table_name = 1;
+  repeated ColumnInfo columns = 2;
+}
+
+message QueryRequest {
+  string sql = 1;
+  optional int32 limit = 2;  // If set, service will enforce this limit
+}
+
+// Streamed response - first message contains schema, subsequent messages contain row batches
+message QueryResponse {
+  oneof payload {
+    QuerySchema schema = 1;
+    RowBatch rows = 2;
+  }
+}
+
+message QuerySchema {
+  repeated ColumnInfo columns = 1;
+}
+
+message RowBatch {
+  repeated Row rows = 1;
+}
+
+message Row {
+  repeated Value values = 1;
+}
+
+// Value can be null or one of several types
+message Value {
+  oneof value {
+    bool is_null = 1;
+    int64 int_value = 2;
+    double double_value = 3;
+    string string_value = 4;
+    bytes bytes_value = 5;
+    bool bool_value = 6;
+  }
+}
