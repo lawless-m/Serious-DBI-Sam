@@ -93,6 +93,15 @@ static bool TryConvertFilter(const TableFilter &filter, const string &column_nam
                 case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
                     op = ">=";
                     break;
+                case ExpressionType::COMPARE_BETWEEN:
+                    // BETWEEN is syntactic sugar for >= AND <=
+                    // DuckDB should decompose this, but handle it just in case
+                    if (!warning_issued) {
+                        context.Explain(StringUtil::Format(
+                            "INFO: BETWEEN filter on '%s' detected - DuckDB should have decomposed this to >= AND <=",
+                            column_name));
+                    }
+                    return false;
                 default:
                     if (!warning_issued) {
                         context.Explain(StringUtil::Format(

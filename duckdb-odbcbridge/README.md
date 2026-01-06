@@ -106,7 +106,10 @@ LEFT JOIN em.orders remote ON local.order_id = remote.id;
 - ✅ Comparisons: `=`, `!=`, `<`, `>`, `<=`, `>=`
 - ✅ NULL checks: `IS NULL`, `IS NOT NULL`
 - ✅ Logic: `AND`, `OR` combinations
-- ⚠️ Not pushed: `LIKE`, `IN`, `BETWEEN` (you'll see a warning)
+- ✅ `BETWEEN x AND y` (decomposed to `>= x AND <= y`)
+- ✅ `IN (a, b, c)` (decomposed to `= a OR = b OR = c`)
+- ⚠️ `LIKE` patterns may not be pushed down (warning shown if applicable)
+- ⚠️ Complex expressions, functions, subqueries cannot be pushed down
 
 When filters can't be pushed down, DuckDB will show a warning and fetch all rows for local filtering.
 
