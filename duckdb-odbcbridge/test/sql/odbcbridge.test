@@ -1,0 +1,16 @@
+# name: test/sql/odbcbridge.test
+# description: Test ODBC Bridge extension
+# group: [odbcbridge]
+
+# Require extension
+require odbcbridge
+
+# Test configuration options
+statement ok
+SET odbcbridge_host = 'localhost';
+
+statement ok
+SET odbcbridge_port = 50051;
+
+# Note: Actual tests require a running ODBC Bridge service
+# These tests just verify the extension loads and settings work
