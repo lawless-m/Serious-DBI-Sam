@@ -23,10 +23,19 @@ static void LoadInternal(DatabaseInstance &instance) {
         LogicalType::INTEGER,
         Value(50051));
 
+    config.AddExtensionOption(
+        "odbcbridge_catalog_name",
+        "Name of the catalog to register (default: dbisam)",
+        LogicalType::VARCHAR,
+        Value("dbisam"));
+
     // Register table functions
     RegisterDbiasmTablesFunction(instance);
     RegisterDbiasmDescribeFunction(instance);
     RegisterDbiasmQueryFunction(instance);
+
+    // Register DBISAM catalog
+    RegisterDbiasmCatalog(instance);
 }
 
 void OdbcbridgeExtension::Load(DuckDB &db) {
