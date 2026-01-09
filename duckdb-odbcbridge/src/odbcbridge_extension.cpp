@@ -34,8 +34,8 @@ static void LoadInternal(DatabaseInstance &instance) {
     RegisterDbiasmDescribeFunction(instance);
     RegisterDbiasmQueryFunction(instance);
 
-    // Register DBISAM catalog
-    RegisterDbiasmCatalog(instance);
+    // TODO: Virtual catalog needs work to compile against DuckDB 1.2.1 API
+    // RegisterDbiasmCatalog(instance);
 }
 
 void OdbcbridgeExtension::Load(DuckDB &db) {

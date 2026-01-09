@@ -76,7 +76,8 @@ set(EXTENSION_SOURCES
     src/grpc_client.cpp
     src/table_functions.cpp
     src/type_mapping.cpp
-    src/dbisam_catalog.cpp
+    # TODO: Virtual catalog needs work to compile against DuckDB 1.2.1 API
+    # src/dbisam_catalog.cpp
 )
 
 # Include DuckDB

@@ -545,6 +545,28 @@ vector<MetadataBlockInfo> DbiasmCatalog::GetMetadataInfo(ClientContext &context)
     return {};
 }
 
+void DbiasmCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+    callback(*main_schema_);
+}
+
+optional_ptr<CatalogEntry> DbiasmCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+    throw NotImplementedException("DBISAM catalog does not support CREATE SCHEMA");
+}
+
+void DbiasmCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+    throw NotImplementedException("DBISAM catalog does not support DROP SCHEMA");
+}
+
+unique_ptr<PhysicalOperator> DbiasmCatalog::PlanDelete(ClientContext &context, LogicalDelete &op,
+                                                        unique_ptr<PhysicalOperator> plan) {
+    throw NotImplementedException("DBISAM catalog does not support DELETE");
+}
+
+unique_ptr<PhysicalOperator> DbiasmCatalog::PlanUpdate(ClientContext &context, LogicalUpdate &op,
+                                                        unique_ptr<PhysicalOperator> plan) {
+    throw NotImplementedException("DBISAM catalog does not support UPDATE");
+}
+
 // ============================================
 // Catalog Registration
 // ============================================
