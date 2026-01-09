@@ -59,17 +59,39 @@ public class OdbcQueryExecutor
         {
             result.Add(new ColumnInfo
             {
-                Name = row["COLUMN_NAME"]?.ToString() ?? "",
-                TypeName = row["TYPE_NAME"]?.ToString() ?? "",
-                OdbcType = Convert.ToInt32(row["DATA_TYPE"] ?? 0),
-                Size = Convert.ToInt32(row["COLUMN_SIZE"] ?? 0),
-                DecimalDigits = Convert.ToInt32(row["DECIMAL_DIGITS"] ?? 0),
-                Nullable = Convert.ToBoolean(row["NULLABLE"] ?? true)
+                Name = GetString(row, "COLUMN_NAME"),
+                TypeName = GetString(row, "TYPE_NAME"),
+                OdbcType = GetInt(row, "DATA_TYPE", 0),
+                Size = GetInt(row, "COLUMN_SIZE", 0),
+                DecimalDigits = GetInt(row, "DECIMAL_DIGITS", 0),
+                Nullable = GetBool(row, "NULLABLE", true)
             });
         }
 
         _logger.LogInformation("Described table {TableName}: {Count} columns", tableName, result.Count);
         return result;
+    }
+
+    // Helper methods for handling DBNull in DataRow
+    private static string GetString(DataRow row, string column)
+    {
+        if (!row.Table.Columns.Contains(column)) return "";
+        var val = row[column];
+        return val is DBNull ? "" : val?.ToString() ?? "";
+    }
+
+    private static int GetInt(DataRow row, string column, int defaultValue)
+    {
+        if (!row.Table.Columns.Contains(column)) return defaultValue;
+        var val = row[column];
+        return val is DBNull ? defaultValue : Convert.ToInt32(val);
+    }
+
+    private static bool GetBool(DataRow row, string column, bool defaultValue)
+    {
+        if (!row.Table.Columns.Contains(column)) return defaultValue;
+        var val = row[column];
+        return val is DBNull ? defaultValue : Convert.ToBoolean(val);
     }
 
     public async IAsyncEnumerable<QueryResponse> ExecuteQueryAsync(

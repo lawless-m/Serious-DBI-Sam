@@ -41,6 +41,20 @@ public:
     void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
     void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 
+    // Read-only catalog - these all throw NotImplementedException
+    optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
+                                           TableCatalogEntry &table) override;
+    optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) override;
+    optional_ptr<CatalogEntry> CreateView(CatalogTransaction transaction, CreateViewInfo &info) override;
+    optional_ptr<CatalogEntry> CreateSequence(CatalogTransaction transaction, CreateSequenceInfo &info) override;
+    optional_ptr<CatalogEntry> CreateTableFunction(CatalogTransaction transaction, CreateTableFunctionInfo &info) override;
+    optional_ptr<CatalogEntry> CreateCopyFunction(CatalogTransaction transaction, CreateCopyFunctionInfo &info) override;
+    optional_ptr<CatalogEntry> CreatePragmaFunction(CatalogTransaction transaction, CreatePragmaFunctionInfo &info) override;
+    optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction transaction, CreateCollationInfo &info) override;
+    optional_ptr<CatalogEntry> CreateType(CatalogTransaction transaction, CreateTypeInfo &info) override;
+    void DropEntry(ClientContext &context, DropInfo &info) override;
+    void Alter(CatalogTransaction transaction, AlterInfo &info) override;
+
 private:
     std::shared_ptr<OdbcBridgeClient> client_;
     std::unordered_map<std::string, unique_ptr<DbiasmTableEntry>> tables_;
@@ -57,9 +71,6 @@ public:
 
     string GetCatalogType() override { return "dbisam"; }
     void Initialize(bool load_builtin) override;
-    optional_ptr<CatalogEntry> GetEntry(CatalogTransaction transaction, CatalogType type,
-                                       const string &schema, const string &name) override;
-    void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
     void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
     optional_ptr<SchemaCatalogEntry> GetSchema(CatalogTransaction transaction, const string &schema_name,
                                                OnEntryNotFound if_not_found, QueryErrorContext error_context = QueryErrorContext()) override;

@@ -12,12 +12,17 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/storage/storage_extension.hpp"
+#include "duckdb/transaction/transaction_manager.hpp"
+#include "duckdb/transaction/transaction.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -96,20 +101,10 @@ static bool TryConvertFilter(const TableFilter &filter, const string &column_nam
                 case ExpressionType::COMPARE_BETWEEN:
                     // BETWEEN is syntactic sugar for >= AND <=
                     // DuckDB should decompose this, but handle it just in case
-                    if (!warning_issued) {
-                        context.Explain(StringUtil::Format(
-                            "INFO: BETWEEN filter on '%s' detected - DuckDB should have decomposed this to >= AND <=",
-                            column_name));
-                    }
                     return false;
                 default:
-                    if (!warning_issued) {
-                        context.Explain(StringUtil::Format(
-                            "WARNING: Filter on '%s' cannot be pushed down to DBISAM (unsupported comparison type). "
-                            "This will fetch all rows and filter locally, which may be slow.",
-                            column_name));
-                        warning_issued = true;
-                    }
+                    // Unsupported comparison type - filter locally
+                    warning_issued = true;
                     return false;
             }
             sql_filter = column_name + " " + op + " " + ValueToSQL(const_filter.constant);
@@ -151,13 +146,7 @@ static bool TryConvertFilter(const TableFilter &filter, const string &column_nam
                     conditions.push_back(child_sql);
                 } else {
                     // If any OR condition can't be pushed, we can't push the whole OR
-                    if (!warning_issued) {
-                        context.Explain(StringUtil::Format(
-                            "WARNING: Complex OR filter on '%s' cannot be fully pushed down to DBISAM. "
-                            "This will fetch all rows and filter locally, which may be slow.",
-                            column_name));
-                        warning_issued = true;
-                    }
+                    warning_issued = true;
                     return false;
                 }
             }
@@ -169,14 +158,8 @@ static bool TryConvertFilter(const TableFilter &filter, const string &column_nam
         }
 
         default:
-            if (!warning_issued) {
-                context.Explain(StringUtil::Format(
-                    "WARNING: Filter on '%s' (type: %s) cannot be pushed down to DBISAM. "
-                    "This will fetch all rows and filter locally, which may be slow. "
-                    "Consider using simple comparisons (=, !=, <, >, <=, >=) for better performance.",
-                    column_name, TableFilterTypeToString(filter.filter_type)));
-                warning_issued = true;
-            }
+            // Unsupported filter type - filter locally
+            warning_issued = true;
             return false;
     }
 }
@@ -202,44 +185,66 @@ struct DbiasmScanGlobalState : public GlobalTableFunctionState {
     std::unique_ptr<QueryReader> reader;
     std::vector<std::vector<Value>> current_batch;
     idx_t batch_offset = 0;
+    idx_t row_id = 0;
     bool finished = false;
+    bool rowid_scan = false;
+    vector<string> projected_columns;
 
     idx_t MaxThreads() const override { return 1; }
 };
 
 static unique_ptr<FunctionData> DbiasmScanBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
-    auto bind_data = make_uniq<DbiasmScanBindData>();
-
-    // Get bind data from table entry
-    auto &table_bind_data = input.bind_data->Cast<DbiasmScanBindData>();
-    bind_data->client = table_bind_data.client;
-    bind_data->table_name = table_bind_data.table_name;
-    bind_data->schema = table_bind_data.schema;
-    bind_data->column_names = table_bind_data.column_names;
-    bind_data->column_types = table_bind_data.column_types;
-
-    return_types = bind_data->column_types;
-    names = bind_data->column_names;
-
-    return bind_data;
+    // This function should not be called when using the catalog approach.
+    // The bind_data is provided directly by TableCatalogEntry::GetScanFunction().
+    // If we reach here, it means the function was called directly which is not supported.
+    throw NotImplementedException("dbisam_scan can only be used via the DBISAM catalog (ATTACH ... TYPE dbisam)");
 }
 
 static unique_ptr<GlobalTableFunctionState> DbiasmScanInit(ClientContext &context, TableFunctionInitInput &input) {
     auto &bind_data = input.bind_data->Cast<DbiasmScanBindData>();
     auto state = make_uniq<DbiasmScanGlobalState>();
 
-    // Build SQL query
+    // Build SQL query with only the projected columns
     std::string sql = "SELECT ";
-    for (size_t i = 0; i < bind_data.column_names.size(); i++) {
+    vector<string> projected_columns;
+
+    // Track if we're doing a row-id scan (for COUNT(*) etc.)
+    bool rowid_scan = false;
+
+    // Use column_ids to determine which columns DuckDB wants
+    if (!input.column_ids.empty()) {
+        for (auto &col_id : input.column_ids) {
+            // COLUMN_IDENTIFIER_ROW_ID = UINT64_MAX means DuckDB wants row IDs
+            if (col_id == std::numeric_limits<column_t>::max()) {
+                rowid_scan = true;
+            } else if (col_id < bind_data.column_names.size()) {
+                projected_columns.push_back(bind_data.column_names[col_id]);
+            }
+        }
+    }
+
+    // If only row-id scan, select first column for row counting
+    if (projected_columns.empty() && !bind_data.column_names.empty()) {
+        projected_columns.push_back(bind_data.column_names[0]);
+    }
+
+    // Store rowid_scan flag for later use
+    state->rowid_scan = rowid_scan;
+
+    // Build column list with quoted identifiers (handles special chars like ?)
+    for (size_t i = 0; i < projected_columns.size(); i++) {
         if (i > 0) sql += ", ";
-        sql += bind_data.column_names[i];
+        sql += "\"" + projected_columns[i] + "\"";
     }
     sql += " FROM " + bind_data.table_name;
 
     if (!bind_data.filter_sql.empty()) {
         sql += " WHERE " + bind_data.filter_sql;
     }
+
+    // Store projected columns for result mapping
+    state->projected_columns = projected_columns;
 
     // Execute query
     state->reader = bind_data.client->Query(sql, bind_data.limit);
@@ -268,8 +273,16 @@ static void DbiasmScanFunc(ClientContext &context, TableFunctionInput &data, Dat
 
         // Copy row to output
         auto &row = state.current_batch[state.batch_offset];
-        for (idx_t col = 0; col < row.size(); col++) {
-            output.SetValue(col, count, row[col]);
+
+        if (state.rowid_scan) {
+            // For COUNT(*) etc., return row IDs
+            output.SetValue(0, count, Value::BIGINT(state.row_id++));
+        } else {
+            // Return actual column data
+            idx_t num_cols = output.ColumnCount();
+            for (idx_t col = 0; col < num_cols && col < row.size(); col++) {
+                output.SetValue(col, count, row[col]);
+            }
         }
 
         state.batch_offset++;
@@ -309,9 +322,62 @@ static unique_ptr<NodeStatistics> DbiasmScanCardinality(ClientContext &context, 
     return make_uniq<NodeStatistics>();
 }
 
-static void DbiasmScanPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData &bind_data_p,
+// Helper to convert expression to SQL
+static bool TryConvertExpressionToSQL(const Expression &expr, const vector<string> &column_names,
+                                       string &sql_filter) {
+    if (expr.type == ExpressionType::COMPARE_EQUAL ||
+        expr.type == ExpressionType::COMPARE_NOTEQUAL ||
+        expr.type == ExpressionType::COMPARE_LESSTHAN ||
+        expr.type == ExpressionType::COMPARE_GREATERTHAN ||
+        expr.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
+        expr.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+
+        auto &comp = expr.Cast<BoundComparisonExpression>();
+        const Expression *col_expr = nullptr;
+        const Expression *const_expr = nullptr;
+
+        // Figure out which side is the column and which is the constant
+        if (comp.left->type == ExpressionType::BOUND_COLUMN_REF &&
+            comp.right->type == ExpressionType::VALUE_CONSTANT) {
+            col_expr = comp.left.get();
+            const_expr = comp.right.get();
+        } else if (comp.right->type == ExpressionType::BOUND_COLUMN_REF &&
+                   comp.left->type == ExpressionType::VALUE_CONSTANT) {
+            col_expr = comp.right.get();
+            const_expr = comp.left.get();
+        } else {
+            return false;
+        }
+
+        auto &col_ref = col_expr->Cast<BoundColumnRefExpression>();
+        auto &const_val = const_expr->Cast<BoundConstantExpression>();
+
+        idx_t col_idx = col_ref.binding.column_index;
+        if (col_idx >= column_names.size()) return false;
+
+        string op;
+        switch (expr.type) {
+            case ExpressionType::COMPARE_EQUAL: op = "="; break;
+            case ExpressionType::COMPARE_NOTEQUAL: op = "!="; break;
+            case ExpressionType::COMPARE_LESSTHAN: op = "<"; break;
+            case ExpressionType::COMPARE_GREATERTHAN: op = ">"; break;
+            case ExpressionType::COMPARE_LESSTHANOREQUALTO: op = "<="; break;
+            case ExpressionType::COMPARE_GREATERTHANOREQUALTO: op = ">="; break;
+            default: return false;
+        }
+
+        sql_filter = "\"" + column_names[col_idx] + "\" " + op + " " + ValueToSQL(const_val.value);
+        return true;
+    }
+    return false;
+}
+
+static void DbiasmScanPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                             vector<unique_ptr<Expression>> &filters) {
-    auto &bind_data = bind_data_p.Cast<DbiasmScanBindData>();
+    if (!bind_data_p) {
+        return;
+    }
+    auto &bind_data = bind_data_p->Cast<DbiasmScanBindData>();
     vector<string> pushed_conditions;
     bool warning_issued = false;
 
@@ -323,7 +389,7 @@ static void DbiasmScanPushdownComplexFilter(ClientContext &context, LogicalGet &
 
             if (col_idx < bind_data.column_names.size()) {
                 string sql_filter;
-                if (TryConvertFilter(filter, bind_data.column_names[col_idx], sql_filter, context, warning_issued)) {
+                if (TryConvertFilter(filter, "\"" + bind_data.column_names[col_idx] + "\"", sql_filter, context, warning_issued)) {
                     pushed_conditions.push_back(sql_filter);
                 } else {
                     bind_data.has_unpushed_filters = true;
@@ -332,27 +398,29 @@ static void DbiasmScanPushdownComplexFilter(ClientContext &context, LogicalGet &
         }
     }
 
+    // Process expression filters
+    for (idx_t i = 0; i < filters.size();) {
+        string sql_filter;
+        if (TryConvertExpressionToSQL(*filters[i], bind_data.column_names, sql_filter)) {
+            pushed_conditions.push_back(sql_filter);
+            // Remove the filter since we're handling it
+            filters.erase(filters.begin() + i);
+        } else {
+            bind_data.has_unpushed_filters = true;
+            i++;
+        }
+    }
+
     // Combine all pushed conditions
     if (!pushed_conditions.empty()) {
         bind_data.filter_sql = StringUtil::Join(pushed_conditions, " AND ");
-
-        // Show info about successful pushdown
-        context.Explain(StringUtil::Format(
-            "INFO: Pushed filter to DBISAM: %s", bind_data.filter_sql));
-    } else if (bind_data.has_unpushed_filters) {
-        // We have filters but couldn't push any
-        if (!warning_issued) {
-            context.Explain(
-                "WARNING: No filters could be pushed down to DBISAM. "
-                "All data will be fetched and filtered locally. "
-                "For better performance, use simple comparisons (=, !=, <, >, <=, >=, IS NULL, IS NOT NULL).");
-        }
     }
 }
 
 static TableFunction GetDbiasmScanFunction() {
     TableFunction func("dbisam_scan", {}, DbiasmScanFunc, DbiasmScanBind, DbiasmScanInit);
     func.filter_pushdown = true;
+    func.projection_pushdown = true;
     func.pushdown_complex_filter = DbiasmScanPushdownComplexFilter;
     func.cardinality = DbiasmScanCardinality;
     return func;
@@ -414,10 +482,19 @@ void DbiasmSchema::LoadTables() {
     auto table_names = client_->ListTables();
 
     for (const auto &table_name : table_names) {
+        // Fetch column info for this table
+        auto columns = client_->DescribeTable(table_name);
+
         CreateTableInfo info;
         info.catalog = catalog.GetName();
         info.schema = name;
         info.table = table_name;
+
+        // Add columns to the table info
+        for (const auto &col : columns) {
+            ColumnDefinition col_def(col.name, MapOdbcTypeToDuckDB(col.odbc_type));
+            info.columns.AddColumn(std::move(col_def));
+        }
 
         auto table_entry = make_uniq<DbiasmTableEntry>(catalog, *this, info, table_name, client_);
         tables_[table_name] = std::move(table_entry);
@@ -475,6 +552,52 @@ void DbiasmSchema::Scan(CatalogType type, const std::function<void(CatalogEntry 
     }
 }
 
+// Read-only schema - these all throw NotImplementedException
+optional_ptr<CatalogEntry> DbiasmSchema::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
+                                                      TableCatalogEntry &table) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+optional_ptr<CatalogEntry> DbiasmSchema::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+optional_ptr<CatalogEntry> DbiasmSchema::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+optional_ptr<CatalogEntry> DbiasmSchema::CreateSequence(CatalogTransaction transaction, CreateSequenceInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+optional_ptr<CatalogEntry> DbiasmSchema::CreateTableFunction(CatalogTransaction transaction, CreateTableFunctionInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+optional_ptr<CatalogEntry> DbiasmSchema::CreateCopyFunction(CatalogTransaction transaction, CreateCopyFunctionInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+optional_ptr<CatalogEntry> DbiasmSchema::CreatePragmaFunction(CatalogTransaction transaction, CreatePragmaFunctionInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+optional_ptr<CatalogEntry> DbiasmSchema::CreateCollation(CatalogTransaction transaction, CreateCollationInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+optional_ptr<CatalogEntry> DbiasmSchema::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+void DbiasmSchema::DropEntry(ClientContext &context, DropInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
+void DbiasmSchema::Alter(CatalogTransaction transaction, AlterInfo &info) {
+    throw NotImplementedException("DBISAM catalog is read-only");
+}
+
 // ============================================
 // DbiasmCatalog Implementation
 // ============================================
@@ -487,19 +610,6 @@ void DbiasmCatalog::Initialize(bool load_builtin) {
     CreateSchemaInfo info;
     info.schema = DEFAULT_SCHEMA;
     main_schema_ = make_uniq<DbiasmSchema>(*this, info, client_);
-}
-
-optional_ptr<CatalogEntry> DbiasmCatalog::GetEntry(CatalogTransaction transaction, CatalogType type,
-                                                   const string &schema, const string &name) {
-    if (schema != DEFAULT_SCHEMA) {
-        return nullptr;
-    }
-
-    return main_schema_->GetEntry(transaction, type, name);
-}
-
-void DbiasmCatalog::Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
-    main_schema_->Scan(context, type, callback);
 }
 
 optional_ptr<SchemaCatalogEntry> DbiasmCatalog::GetSchema(CatalogTransaction transaction, const string &schema_name,
@@ -568,47 +678,98 @@ unique_ptr<PhysicalOperator> DbiasmCatalog::PlanUpdate(ClientContext &context, L
 }
 
 // ============================================
+// Read-only Transaction Manager
+// ============================================
+
+class DbiasmTransaction : public Transaction {
+public:
+    DbiasmTransaction(TransactionManager &manager, ClientContext &context)
+        : Transaction(manager, context) {}
+};
+
+class DbiasmTransactionManager : public TransactionManager {
+public:
+    explicit DbiasmTransactionManager(AttachedDatabase &db) : TransactionManager(db) {}
+
+    Transaction &StartTransaction(ClientContext &context) override {
+        auto transaction = make_uniq<DbiasmTransaction>(*this, context);
+        auto &result = *transaction;
+        active_transactions.push_back(std::move(transaction));
+        return result;
+    }
+
+    ErrorData CommitTransaction(ClientContext &context, Transaction &transaction) override {
+        // Read-only, nothing to commit
+        return ErrorData();
+    }
+
+    void RollbackTransaction(Transaction &transaction) override {
+        // Read-only, nothing to rollback
+    }
+
+    void Checkpoint(ClientContext &context, bool force) override {
+        // Read-only, nothing to checkpoint
+    }
+
+private:
+    vector<unique_ptr<Transaction>> active_transactions;
+};
+
+static unique_ptr<TransactionManager> DbiasmCreateTransactionManager(StorageExtensionInfo *storage_info,
+                                                                      AttachedDatabase &db, Catalog &catalog) {
+    return make_uniq<DbiasmTransactionManager>(db);
+}
+
+// ============================================
+// Storage Extension for ATTACH support
+// ============================================
+
+struct DbiasmStorageExtensionInfo : public StorageExtensionInfo {
+    // No additional info needed - connection details come from extension settings
+};
+
+static unique_ptr<Catalog> DbiasmAttach(StorageExtensionInfo *storage_info, ClientContext &context,
+                                         AttachedDatabase &db, const string &name, AttachInfo &info,
+                                         AccessMode access_mode) {
+    // Get connection settings
+    std::string host = "localhost";
+    int32_t port = 50051;
+
+    Value host_value, port_value;
+    if (context.TryGetCurrentSetting("odbcbridge_host", host_value)) {
+        host = host_value.GetValue<std::string>();
+    }
+    if (context.TryGetCurrentSetting("odbcbridge_port", port_value)) {
+        port = port_value.GetValue<int32_t>();
+    }
+
+    // Check for overrides in attach options
+    for (auto &entry : info.options) {
+        auto lower_name = StringUtil::Lower(entry.first);
+        if (lower_name == "host") {
+            host = entry.second.GetValue<std::string>();
+        } else if (lower_name == "port") {
+            port = entry.second.GetValue<int32_t>();
+        }
+    }
+
+    return make_uniq<DbiasmCatalog>(db, host, port);
+}
+
+// ============================================
 // Catalog Registration
 // ============================================
 
 void RegisterDbiasmCatalog(DatabaseInstance &db) {
     auto &config = DBConfig::GetConfig(db);
 
-    // Get connection configuration
-    std::string host = "localhost";
-    int port = 50051;
-    std::string catalog_name = "dbisam";
+    // Create and register the storage extension
+    auto storage_ext = make_uniq<StorageExtension>();
+    storage_ext->attach = DbiasmAttach;
+    storage_ext->create_transaction_manager = DbiasmCreateTransactionManager;
+    storage_ext->storage_info = make_shared_ptr<DbiasmStorageExtensionInfo>();
 
-    Value host_value, port_value, catalog_name_value;
-    if (config.options.default_extension_options.find("odbcbridge_host") != config.options.default_extension_options.end()) {
-        host_value = config.options.default_extension_options["odbcbridge_host"];
-        host = host_value.GetValue<std::string>();
-    }
-
-    if (config.options.default_extension_options.find("odbcbridge_port") != config.options.default_extension_options.end()) {
-        port_value = config.options.default_extension_options["odbcbridge_port"];
-        port = port_value.GetValue<int32_t>();
-    }
-
-    if (config.options.default_extension_options.find("odbcbridge_catalog_name") != config.options.default_extension_options.end()) {
-        catalog_name_value = config.options.default_extension_options["odbcbridge_catalog_name"];
-        catalog_name = catalog_name_value.GetValue<std::string>();
-    }
-
-    // Attach the DBISAM catalog
-    auto &catalog_manager = Catalog::GetSystemCatalog(db);
-
-    // Create attach info
-    AttachInfo attach_info;
-    attach_info.name = catalog_name;
-    attach_info.options["type"] = Value("dbisam");
-
-    // Create the catalog
-    auto attached_db = make_uniq<AttachedDatabase>(db, attach_info);
-    auto dbisam_catalog = make_uniq<DbiasmCatalog>(*attached_db, host, port);
-
-    // Register the catalog
-    catalog_manager.RegisterCatalog(std::move(dbisam_catalog));
+    config.storage_extensions["odbcbridge"] = std::move(storage_ext);
 }
 
 } // namespace duckdb
