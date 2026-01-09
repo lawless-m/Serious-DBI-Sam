@@ -56,6 +56,9 @@ add_library(odbcbridge_proto STATIC
     ${GRPC_SRCS}
 )
 
+# Need PIC for linking into shared library
+set_target_properties(odbcbridge_proto PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 target_link_libraries(odbcbridge_proto
     PUBLIC
     protobuf::libprotobuf
@@ -81,7 +84,7 @@ if(NOT DEFINED DUCKDB_DIR)
     FetchContent_Declare(
         duckdb
         GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-        GIT_TAG v1.1.0
+        GIT_TAG v1.2.1
     )
     FetchContent_MakeAvailable(duckdb)
     set(DUCKDB_DIR ${duckdb_SOURCE_DIR})
@@ -92,10 +95,16 @@ include_directories(${DUCKDB_DIR}/src/include)
 # Build loadable extension
 add_library(${LOADABLE_EXTENSION_NAME} SHARED ${EXTENSION_SOURCES})
 
+# Required for static linking with DuckDB
+set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CXX_VISIBILITY_PRESET hidden)
+
 target_link_libraries(${LOADABLE_EXTENSION_NAME}
     PRIVATE
     odbcbridge_proto
     gRPC::grpc++
+    duckdb_static
+    -Wl,--gc-sections
+    -Wl,--exclude-libs,ALL
 )
 
 target_include_directories(${LOADABLE_EXTENSION_NAME}
@@ -104,11 +113,34 @@ target_include_directories(${LOADABLE_EXTENSION_NAME}
     ${PROTO_OUT_DIR}
 )
 
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PUBLIC -DDUCKDB_BUILD_LOADABLE_EXTENSION)
+
 set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES
     OUTPUT_NAME ${TARGET_NAME}
     PREFIX ""
     SUFFIX ".duckdb_extension"
 )
+
+# Use null.txt from DuckDB scripts directory
+set(NULL_FILE ${duckdb_SOURCE_DIR}/scripts/null.txt)
+
+# Use DuckDB's version - hardcoded to match FetchContent tag
+set(DUCKDB_VERSION_NORMALIZED "v1.2.1")
+
+# Add metadata to extension (required for DuckDB to load it)
+add_custom_command(
+    TARGET ${LOADABLE_EXTENSION_NAME}
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DABI_TYPE=CPP
+        -DEXTENSION=$<TARGET_FILE:${LOADABLE_EXTENSION_NAME}>
+        -DPLATFORM_FILE=${duckdb_BINARY_DIR}/duckdb_platform_out
+        -DVERSION_FIELD=${DUCKDB_VERSION_NORMALIZED}
+        -DEXTENSION_VERSION=${DUCKDB_VERSION_NORMALIZED}
+        -DNULL_FILE=${NULL_FILE}
+        -P ${duckdb_SOURCE_DIR}/scripts/append_metadata.cmake
+)
+add_dependencies(${LOADABLE_EXTENSION_NAME} duckdb_platform)
 
 # Build static extension for linking into DuckDB
 add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES})

@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 using OdbcBridge.Configuration;
 using OdbcBridge.Data;
 using OdbcBridge.Services;
@@ -6,6 +7,21 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Add Windows service support
 builder.Host.UseWindowsService();
+
+// Configure Kestrel for HTTP/2 (required for gRPC)
+builder.WebHost.ConfigureKestrel(options =>
+{
+    // HTTP/2 only for gRPC
+    options.ListenAnyIP(50051, listenOptions =>
+    {
+        listenOptions.Protocols = HttpProtocols.Http2;
+    });
+    // HTTP/1.1 on separate port for health checks
+    options.ListenAnyIP(50052, listenOptions =>
+    {
+        listenOptions.Protocols = HttpProtocols.Http1;
+    });
+});
 
 // Configure gRPC
 builder.Services.AddGrpc(options =>

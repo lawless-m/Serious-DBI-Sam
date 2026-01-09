@@ -31,8 +31,11 @@ static std::pair<std::string, int32_t> GetConnectionConfig(ClientContext &contex
 // dbisam_tables() - List available tables
 // ============================================
 
-struct DbiasmTablesData : public TableFunctionData {
+struct DbiasmTablesBindData : public TableFunctionData {
     std::vector<std::string> tables;
+};
+
+struct DbiasmTablesState : public GlobalTableFunctionState {
     idx_t offset = 0;
 };
 
@@ -45,7 +48,7 @@ static unique_ptr<FunctionData> DbiasmTablesBind(
     return_types.push_back(LogicalType::VARCHAR);
     names.push_back("table_name");
 
-    auto result = make_uniq<DbiasmTablesData>();
+    auto result = make_uniq<DbiasmTablesBindData>();
 
     // Connect and fetch table list
     auto [host, port] = GetConnectionConfig(context);
@@ -55,17 +58,23 @@ static unique_ptr<FunctionData> DbiasmTablesBind(
     return std::move(result);
 }
 
+static unique_ptr<GlobalTableFunctionState> DbiasmTablesInitGlobal(
+    ClientContext &context, TableFunctionInitInput &input) {
+    return make_uniq<DbiasmTablesState>();
+}
+
 static void DbiasmTablesExecute(
     ClientContext &context,
     TableFunctionInput &input,
     DataChunk &output) {
 
-    auto &data = input.bind_data->Cast<DbiasmTablesData>();
+    auto &bind_data = input.bind_data->Cast<DbiasmTablesBindData>();
+    auto &state = input.global_state->Cast<DbiasmTablesState>();
 
     idx_t count = 0;
-    while (data.offset < data.tables.size() && count < STANDARD_VECTOR_SIZE) {
-        output.SetValue(0, count, Value(data.tables[data.offset]));
-        data.offset++;
+    while (state.offset < bind_data.tables.size() && count < STANDARD_VECTOR_SIZE) {
+        output.SetValue(0, count, Value(bind_data.tables[state.offset]));
+        state.offset++;
         count++;
     }
     output.SetCardinality(count);
@@ -73,6 +82,7 @@ static void DbiasmTablesExecute(
 
 void RegisterDbiasmTablesFunction(DatabaseInstance &db) {
     TableFunction func("dbisam_tables", {}, DbiasmTablesExecute, DbiasmTablesBind);
+    func.init_global = DbiasmTablesInitGlobal;
     ExtensionUtil::RegisterFunction(db, func);
 }
 
@@ -80,8 +90,11 @@ void RegisterDbiasmTablesFunction(DatabaseInstance &db) {
 // dbisam_describe(table_name) - Table schema
 // ============================================
 
-struct DbiasmDescribeData : public TableFunctionData {
+struct DbiasmDescribeBindData : public TableFunctionData {
     std::vector<ColumnInfo> columns;
+};
+
+struct DbiasmDescribeState : public GlobalTableFunctionState {
     idx_t offset = 0;
 };
 
@@ -104,10 +117,15 @@ static unique_ptr<FunctionData> DbiasmDescribeBind(
     auto [host, port] = GetConnectionConfig(context);
     OdbcBridgeClient client(host, port);
 
-    auto result = make_uniq<DbiasmDescribeData>();
+    auto result = make_uniq<DbiasmDescribeBindData>();
     result->columns = client.DescribeTable(table_name);
 
     return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> DbiasmDescribeInitGlobal(
+    ClientContext &context, TableFunctionInitInput &input) {
+    return make_uniq<DbiasmDescribeState>();
 }
 
 static void DbiasmDescribeExecute(
@@ -115,17 +133,18 @@ static void DbiasmDescribeExecute(
     TableFunctionInput &input,
     DataChunk &output) {
 
-    auto &data = input.bind_data->Cast<DbiasmDescribeData>();
+    auto &bind_data = input.bind_data->Cast<DbiasmDescribeBindData>();
+    auto &state = input.global_state->Cast<DbiasmDescribeState>();
 
     idx_t count = 0;
-    while (data.offset < data.columns.size() && count < STANDARD_VECTOR_SIZE) {
-        auto &col = data.columns[data.offset];
+    while (state.offset < bind_data.columns.size() && count < STANDARD_VECTOR_SIZE) {
+        auto &col = bind_data.columns[state.offset];
         output.SetValue(0, count, Value(col.name));
         output.SetValue(1, count, Value(col.type_name));
         output.SetValue(2, count, Value::INTEGER(col.size));
         output.SetValue(3, count, Value::INTEGER(col.decimal_digits));
         output.SetValue(4, count, Value::BOOLEAN(col.nullable));
-        data.offset++;
+        state.offset++;
         count++;
     }
     output.SetCardinality(count);
@@ -134,6 +153,7 @@ static void DbiasmDescribeExecute(
 void RegisterDbiasmDescribeFunction(DatabaseInstance &db) {
     TableFunction func("dbisam_describe", {LogicalType::VARCHAR},
                        DbiasmDescribeExecute, DbiasmDescribeBind);
+    func.init_global = DbiasmDescribeInitGlobal;
     ExtensionUtil::RegisterFunction(db, func);
 }
 
@@ -141,13 +161,21 @@ void RegisterDbiasmDescribeFunction(DatabaseInstance &db) {
 // dbisam_query(sql, [limit]) - Execute query
 // ============================================
 
-struct DbiasmQueryData : public TableFunctionData {
+struct DbiasmQueryBindData : public TableFunctionData {
+    std::string sql;
+    std::optional<int32_t> limit;
+    std::string host;
+    int32_t port;
+    std::vector<ColumnInfo> schema;
+};
+
+struct DbiasmQueryState : public GlobalTableFunctionState {
     std::unique_ptr<OdbcBridgeClient> client;
     std::unique_ptr<QueryReader> reader;
     std::vector<std::vector<Value>> current_batch;
-    std::vector<ColumnInfo> schema;
     idx_t batch_offset = 0;
     bool finished = false;
+    bool initialized = false;
 };
 
 static unique_ptr<FunctionData> DbiasmQueryBind(
@@ -164,10 +192,16 @@ static unique_ptr<FunctionData> DbiasmQueryBind(
 
     auto [host, port] = GetConnectionConfig(context);
 
-    auto result = make_uniq<DbiasmQueryData>();
-    result->client = make_uniq<OdbcBridgeClient>(host, port);
-    result->reader = result->client->Query(sql, limit);
-    result->schema = result->reader->GetSchema();
+    auto result = make_uniq<DbiasmQueryBindData>();
+    result->sql = sql;
+    result->limit = limit;
+    result->host = host;
+    result->port = port;
+
+    // We need to query to get schema at bind time
+    OdbcBridgeClient client(host, port);
+    auto reader = client.Query(sql, limit);
+    result->schema = reader->GetSchema();
 
     // Set return types based on schema
     for (const auto &col : result->schema) {
@@ -178,14 +212,27 @@ static unique_ptr<FunctionData> DbiasmQueryBind(
     return std::move(result);
 }
 
+static unique_ptr<GlobalTableFunctionState> DbiasmQueryInitGlobal(
+    ClientContext &context, TableFunctionInitInput &input) {
+    return make_uniq<DbiasmQueryState>();
+}
+
 static void DbiasmQueryExecute(
     ClientContext &context,
     TableFunctionInput &input,
     DataChunk &output) {
 
-    auto &data = input.bind_data->Cast<DbiasmQueryData>();
+    auto &bind_data = input.bind_data->Cast<DbiasmQueryBindData>();
+    auto &state = input.global_state->Cast<DbiasmQueryState>();
 
-    if (data.finished) {
+    // Initialize connection on first call
+    if (!state.initialized) {
+        state.client = make_uniq<OdbcBridgeClient>(bind_data.host, bind_data.port);
+        state.reader = state.client->Query(bind_data.sql, bind_data.limit);
+        state.initialized = true;
+    }
+
+    if (state.finished) {
         output.SetCardinality(0);
         return;
     }
@@ -193,21 +240,21 @@ static void DbiasmQueryExecute(
     idx_t count = 0;
     while (count < STANDARD_VECTOR_SIZE) {
         // Need more rows from current batch?
-        if (data.batch_offset >= data.current_batch.size()) {
-            if (!data.reader->ReadBatch(data.current_batch)) {
-                data.finished = true;
+        if (state.batch_offset >= state.current_batch.size()) {
+            if (!state.reader->ReadBatch(state.current_batch)) {
+                state.finished = true;
                 break;
             }
-            data.batch_offset = 0;
+            state.batch_offset = 0;
         }
 
         // Copy row to output
-        auto &row = data.current_batch[data.batch_offset];
+        auto &row = state.current_batch[state.batch_offset];
         for (idx_t col = 0; col < row.size(); col++) {
             output.SetValue(col, count, row[col]);
         }
 
-        data.batch_offset++;
+        state.batch_offset++;
         count++;
     }
 
@@ -218,11 +265,13 @@ void RegisterDbiasmQueryFunction(DatabaseInstance &db) {
     // Version with just SQL
     TableFunction func1("dbisam_query", {LogicalType::VARCHAR},
                         DbiasmQueryExecute, DbiasmQueryBind);
+    func1.init_global = DbiasmQueryInitGlobal;
     ExtensionUtil::RegisterFunction(db, func1);
 
     // Version with SQL and limit
     TableFunction func2("dbisam_query", {LogicalType::VARCHAR, LogicalType::INTEGER},
                         DbiasmQueryExecute, DbiasmQueryBind);
+    func2.init_global = DbiasmQueryInitGlobal;
     ExtensionUtil::RegisterFunction(db, func2);
 }
 

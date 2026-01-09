@@ -23,17 +23,30 @@ public:
 
         // First message should be schema
         odbcbridge::QueryResponse response;
-        if (reader_->Read(&response) && response.has_schema()) {
-            for (const auto &col : response.schema().columns()) {
-                schema_.push_back({
-                    col.name(),
-                    col.type_name(),
-                    col.odbc_type(),
-                    col.size(),
-                    col.decimal_digits(),
-                    col.nullable()
-                });
-            }
+        if (!reader_->Read(&response)) {
+            auto status = reader_->Finish();
+            throw IOException("Query failed to read first response: " + status.error_message() +
+                            " (code: " + std::to_string(static_cast<int>(status.error_code())) + ")");
+        }
+
+        if (!response.has_schema()) {
+            std::string got_type = response.has_rows() ? "rows" : "empty";
+            throw IOException("Query response missing schema - got: " + got_type);
+        }
+
+        for (const auto &col : response.schema().columns()) {
+            schema_.push_back({
+                col.name(),
+                col.type_name(),
+                col.odbc_type(),
+                col.size(),
+                col.decimal_digits(),
+                col.nullable()
+            });
+        }
+
+        if (schema_.empty()) {
+            throw IOException("Query returned empty schema (0 columns)");
         }
     }
 

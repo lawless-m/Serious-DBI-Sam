@@ -128,16 +128,40 @@ public class OdbcQueryExecutor
 
         if (schemaTable != null)
         {
+            // Log available columns for debugging
+            _logger.LogDebug("Schema table columns: {Columns}",
+                string.Join(", ", schemaTable.Columns.Cast<DataColumn>().Select(c => c.ColumnName)));
+
             foreach (DataRow row in schemaTable.Rows)
             {
+                // DataTypeName may not exist in all ODBC drivers
+                string typeName = "";
+                if (schemaTable.Columns.Contains("DataTypeName"))
+                {
+                    typeName = row["DataTypeName"]?.ToString() ?? "";
+                }
+                else if (schemaTable.Columns.Contains("DataType"))
+                {
+                    // Fallback: use .NET type name
+                    typeName = (row["DataType"] as Type)?.Name ?? "";
+                }
+
                 schema.Columns.Add(new ColumnInfo
                 {
                     Name = row["ColumnName"]?.ToString() ?? "",
-                    TypeName = row["DataTypeName"]?.ToString() ?? "",
-                    OdbcType = Convert.ToInt32(row["ProviderType"] ?? 0),
-                    Size = Convert.ToInt32(row["ColumnSize"] ?? 0),
-                    DecimalDigits = Convert.ToInt32(row["NumericScale"] ?? 0),
-                    Nullable = Convert.ToBoolean(row["AllowDBNull"] ?? true)
+                    TypeName = typeName,
+                    OdbcType = schemaTable.Columns.Contains("ProviderType")
+                        ? Convert.ToInt32(row["ProviderType"] ?? 0)
+                        : 12, // SQL_VARCHAR as fallback
+                    Size = schemaTable.Columns.Contains("ColumnSize")
+                        ? Convert.ToInt32(row["ColumnSize"] ?? 0)
+                        : 0,
+                    DecimalDigits = schemaTable.Columns.Contains("NumericScale")
+                        ? Convert.ToInt32(row["NumericScale"] ?? 0)
+                        : 0,
+                    Nullable = schemaTable.Columns.Contains("AllowDBNull")
+                        ? Convert.ToBoolean(row["AllowDBNull"] ?? true)
+                        : true
                 });
             }
         }
@@ -226,22 +250,21 @@ public class OdbcQueryExecutor
 
         var limit = requestedLimit.Value;
 
-        // Check for existing LIMIT clause (simple regex, handles most cases)
-        var limitMatch = Regex.Match(sql, @"\bLIMIT\s+(\d+)", RegexOptions.IgnoreCase);
-        if (limitMatch.Success)
+        // Check for existing TOP clause at END of query (DBISAM style: SELECT * FROM t TOP 5)
+        var topMatch = Regex.Match(sql, @"\bTOP\s+(\d+)\s*$", RegexOptions.IgnoreCase);
+        if (topMatch.Success)
         {
-            var existingLimit = int.Parse(limitMatch.Groups[1].Value);
+            var existingLimit = int.Parse(topMatch.Groups[1].Value);
             if (existingLimit <= limit)
                 return sql; // Existing limit is smaller, keep it
 
             // Replace with smaller limit
-            return Regex.Replace(sql, @"\bLIMIT\s+\d+", $"LIMIT {limit}",
+            return Regex.Replace(sql, @"\bTOP\s+\d+\s*$", $"TOP {limit}",
                 RegexOptions.IgnoreCase);
         }
 
-        // No existing limit - append one
-        // Remove trailing semicolon if present
+        // No existing limit - append TOP at the end (DBISAM style)
         sql = sql.TrimEnd().TrimEnd(';');
-        return $"{sql} LIMIT {limit}";
+        return $"{sql} TOP {limit}";
     }
 }
