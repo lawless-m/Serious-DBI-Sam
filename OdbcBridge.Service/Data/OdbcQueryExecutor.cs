@@ -31,16 +31,13 @@ public class OdbcQueryExecutor
         var tables = conn.GetSchema("Tables");
         var result = new List<string>();
 
+        // DBISAM has no views, so return all tables regardless of TABLE_TYPE
         foreach (DataRow row in tables.Rows)
         {
-            var tableType = row["TABLE_TYPE"]?.ToString();
-            if (tableType == "TABLE")
+            var tableName = row["TABLE_NAME"]?.ToString();
+            if (!string.IsNullOrEmpty(tableName))
             {
-                var tableName = row["TABLE_NAME"]?.ToString();
-                if (!string.IsNullOrEmpty(tableName))
-                {
-                    result.Add(tableName);
-                }
+                result.Add(tableName);
             }
         }
 
@@ -212,6 +209,17 @@ public class OdbcQueryExecutor
 
         try
         {
+            // First, check the actual .NET type from the reader (more reliable than ODBC type codes)
+            var fieldType = reader.GetFieldType(ordinal);
+
+            // Handle DateTime/.NET date types regardless of ODBC type code
+            if (fieldType == typeof(DateTime))
+            {
+                var dt = reader.GetDateTime(ordinal);
+                // Return in ISO format for DuckDB
+                return new Value { StringValue = dt.ToString("yyyy-MM-dd") };
+            }
+
             return odbcType switch
             {
                 // Integer types: SQL_TINYINT (-6), SQL_SMALLINT (5), SQL_INTEGER (4), SQL_BIGINT (-5)

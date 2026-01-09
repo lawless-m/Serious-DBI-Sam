@@ -323,8 +323,9 @@ static unique_ptr<NodeStatistics> DbiasmScanCardinality(ClientContext &context, 
 }
 
 // Helper to convert expression to SQL
+// column_ids maps from output column index to table column index
 static bool TryConvertExpressionToSQL(const Expression &expr, const vector<string> &column_names,
-                                       string &sql_filter) {
+                                       const vector<ColumnIndex> &column_ids, string &sql_filter) {
     if (expr.type == ExpressionType::COMPARE_EQUAL ||
         expr.type == ExpressionType::COMPARE_NOTEQUAL ||
         expr.type == ExpressionType::COMPARE_LESSTHAN ||
@@ -352,8 +353,13 @@ static bool TryConvertExpressionToSQL(const Expression &expr, const vector<strin
         auto &col_ref = col_expr->Cast<BoundColumnRefExpression>();
         auto &const_val = const_expr->Cast<BoundConstantExpression>();
 
-        idx_t col_idx = col_ref.binding.column_index;
-        if (col_idx >= column_names.size()) return false;
+        // col_ref.binding.column_index is the output column index
+        // We need to map it to the table column index via column_ids
+        idx_t output_col_idx = col_ref.binding.column_index;
+        if (output_col_idx >= column_ids.size()) return false;
+
+        idx_t table_col_idx = column_ids[output_col_idx].GetPrimaryIndex();
+        if (table_col_idx >= column_names.size()) return false;
 
         string op;
         switch (expr.type) {
@@ -366,7 +372,7 @@ static bool TryConvertExpressionToSQL(const Expression &expr, const vector<strin
             default: return false;
         }
 
-        sql_filter = "\"" + column_names[col_idx] + "\" " + op + " " + ValueToSQL(const_val.value);
+        sql_filter = "\"" + column_names[table_col_idx] + "\" " + op + " " + ValueToSQL(const_val.value);
         return true;
     }
     return false;
@@ -399,9 +405,11 @@ static void DbiasmScanPushdownComplexFilter(ClientContext &context, LogicalGet &
     }
 
     // Process expression filters
+    // get.GetColumnIds() maps output column index to table column index
+    auto &column_ids = get.GetColumnIds();
     for (idx_t i = 0; i < filters.size();) {
         string sql_filter;
-        if (TryConvertExpressionToSQL(*filters[i], bind_data.column_names, sql_filter)) {
+        if (TryConvertExpressionToSQL(*filters[i], bind_data.column_names, column_ids, sql_filter)) {
             pushed_conditions.push_back(sql_filter);
             // Remove the filter since we're handling it
             filters.erase(filters.begin() + i);

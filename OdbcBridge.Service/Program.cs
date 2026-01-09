@@ -8,6 +8,13 @@ var builder = WebApplication.CreateBuilder(args);
 // Add Windows service support
 builder.Host.UseWindowsService();
 
+// Configure UTF-8 file logging
+var logDir = builder.Configuration.GetSection("OdbcBridge")["LogDir"];
+if (!string.IsNullOrEmpty(logDir))
+{
+    builder.Logging.AddUtf8FileLogger(logDir);
+}
+
 // Configure Kestrel for HTTP/2 (required for gRPC)
 builder.WebHost.ConfigureKestrel(options =>
 {

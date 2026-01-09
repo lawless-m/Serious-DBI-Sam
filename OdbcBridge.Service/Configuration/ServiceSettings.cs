@@ -8,6 +8,7 @@ public class ServiceSettings
     public int BatchSize { get; set; } = 1000;
     public int ConnectionTimeout { get; set; } = 30;
     public int CommandTimeout { get; set; } = 300;
+    public string? LogDir { get; set; }
 
     public string GetConnectionString()
     {
