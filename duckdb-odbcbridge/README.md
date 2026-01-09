@@ -27,6 +27,7 @@ SELECT * FROM dbisam_query('SELECT * FROM tablename', 1000);
 ```sql
 SET odbcbridge_host = '192.168.1.100';
 SET odbcbridge_port = 50051;
+SET odbcbridge_catalog_name = 'em';  -- Optional: customize catalog name (default: 'dbisam')
 ```
 
 ## Building
@@ -55,6 +56,8 @@ make debug
 
 ## Usage
 
+### Table Functions
+
 ```sql
 -- Load extension
 LOAD 'path/to/odbcbridge.duckdb_extension';
@@ -63,10 +66,52 @@ LOAD 'path/to/odbcbridge.duckdb_extension';
 SET odbcbridge_host = '192.168.1.100';
 SET odbcbridge_port = 50051;
 
--- Query data
+-- Query data using table functions
 SELECT * FROM dbisam_tables();
 SELECT * FROM dbisam_query('SELECT * FROM customers WHERE active = 1');
 ```
+
+### Virtual Tables (Direct SQL Access)
+
+The virtual table system automatically pushes filters down to DBISAM for better performance.
+
+```sql
+-- Load extension
+LOAD 'path/to/odbcbridge.duckdb_extension';
+
+-- Configure connection
+SET odbcbridge_host = '192.168.1.100';
+SET odbcbridge_port = 50051;
+SET odbcbridge_catalog_name = 'em';  -- Optional: use 'em' instead of 'dbisam'
+
+-- Query tables directly with filter pushdown!
+SELECT * FROM em.products WHERE price > 100 AND active = 1;
+-- ✅ Pushed to DBISAM: Only matching rows transferred
+
+SELECT * FROM em.customers WHERE created_date >= '2024-01-01';
+-- ✅ Pushed to DBISAM: Efficient date filtering
+
+-- Join remote tables
+SELECT p.name, c.company_name
+FROM em.products p
+JOIN em.customers c ON p.customer_id = c.id;
+
+-- Mix with local DuckDB tables
+SELECT local.*, remote.status
+FROM local_table local
+LEFT JOIN em.orders remote ON local.order_id = remote.id;
+```
+
+**Filter Pushdown Support:**
+- ✅ Comparisons: `=`, `!=`, `<`, `>`, `<=`, `>=`
+- ✅ NULL checks: `IS NULL`, `IS NOT NULL`
+- ✅ Logic: `AND`, `OR` combinations
+- ✅ `BETWEEN x AND y` (decomposed to `>= x AND <= y`)
+- ✅ `IN (a, b, c)` (decomposed to `= a OR = b OR = c`)
+- ⚠️ `LIKE` patterns may not be pushed down (warning shown if applicable)
+- ⚠️ Complex expressions, functions, subqueries cannot be pushed down
+
+When filters can't be pushed down, DuckDB will show a warning and fetch all rows for local filtering.
 
 ## Requirements
 
