@@ -190,6 +190,11 @@ struct DbiasmScanGlobalState : public GlobalTableFunctionState {
     bool rowid_scan = false;
     vector<string> projected_columns;
 
+    // Set to >= 0 when we've replaced a row-id-only scan with a remote
+    // COUNT(*); ScanFunc then emits this many synthetic row-ids without
+    // pulling any actual rows over gRPC.
+    int64_t synthetic_count = -1;
+
     idx_t MaxThreads() const override { return 1; }
 };
 
@@ -232,6 +237,23 @@ static unique_ptr<GlobalTableFunctionState> DbiasmScanInit(ClientContext &contex
     // Store rowid_scan flag for later use
     state->rowid_scan = rowid_scan;
 
+    // Row-id-only scan (COUNT(*) and friends): replace the full table fetch
+    // with a remote COUNT(*) and emit synthetic row-ids locally.
+    if (rowid_scan && !bind_data.limit.has_value()) {
+        std::string count_sql = "SELECT COUNT(*) FROM " + bind_data.table_name;
+        if (!bind_data.filter_sql.empty()) {
+            count_sql += " WHERE " + bind_data.filter_sql;
+        }
+        auto count_reader = bind_data.client->Query(count_sql, std::nullopt);
+        std::vector<std::vector<Value>> rows;
+        if (count_reader->ReadBatch(rows) && !rows.empty() && !rows[0].empty()) {
+            state->synthetic_count = rows[0][0].DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+        } else {
+            state->synthetic_count = 0;
+        }
+        return state;
+    }
+
     // Build column list with quoted identifiers (handles special chars like ?)
     for (size_t i = 0; i < projected_columns.size(); i++) {
         if (i > 0) sql += ", ";
@@ -257,6 +279,20 @@ static void DbiasmScanFunc(ClientContext &context, TableFunctionInput &data, Dat
 
     if (state.finished) {
         output.SetCardinality(0);
+        return;
+    }
+
+    if (state.synthetic_count >= 0) {
+        idx_t total = static_cast<idx_t>(state.synthetic_count);
+        idx_t remaining = total > state.row_id ? total - state.row_id : 0;
+        idx_t emit = std::min(remaining, static_cast<idx_t>(STANDARD_VECTOR_SIZE));
+        for (idx_t i = 0; i < emit; i++) {
+            output.SetValue(0, i, Value::BIGINT(state.row_id++));
+        }
+        output.SetCardinality(emit);
+        if (emit == 0) {
+            state.finished = true;
+        }
         return;
     }
 
@@ -482,39 +518,38 @@ DbiasmSchema::DbiasmSchema(Catalog &catalog, CreateSchemaInfo &info,
     : SchemaCatalogEntry(catalog, info), client_(client) {
 }
 
-void DbiasmSchema::LoadTables() {
-    if (tables_loaded_) {
+void DbiasmSchema::EnsureNamesLoaded() {
+    if (names_loaded_) {
         return;
     }
-
-    auto table_names = client_->ListTables();
-
-    for (const auto &table_name : table_names) {
-        // Fetch column info for this table
-        auto columns = client_->DescribeTable(table_name);
-
-        CreateTableInfo info;
-        info.catalog = catalog.GetName();
-        info.schema = name;
-        info.table = table_name;
-
-        // Add columns to the table info
-        for (const auto &col : columns) {
-            ColumnDefinition col_def(col.name, MapOdbcTypeToDuckDB(col.odbc_type));
-            info.columns.AddColumn(std::move(col_def));
-        }
-
-        auto table_entry = make_uniq<DbiasmTableEntry>(catalog, *this, info, table_name, client_);
-        tables_[table_name] = std::move(table_entry);
+    auto names = client_->ListTables();
+    for (auto &n : names) {
+        table_names_.insert(n);
     }
-
-    tables_loaded_ = true;
+    names_loaded_ = true;
 }
 
-void DbiasmSchema::EnsureTablesLoaded() {
-    if (!tables_loaded_) {
-        LoadTables();
+DbiasmTableEntry *DbiasmSchema::EnsureTableEntry(const std::string &name) {
+    auto it = tables_.find(name);
+    if (it != tables_.end()) {
+        return it->second.get();
     }
+
+    auto columns = client_->DescribeTable(name);
+
+    CreateTableInfo info;
+    info.catalog = catalog.GetName();
+    info.schema = this->name;
+    info.table = name;
+    for (const auto &col : columns) {
+        ColumnDefinition col_def(col.name, MapOdbcTypeToDuckDB(col.odbc_type));
+        info.columns.AddColumn(std::move(col_def));
+    }
+
+    auto entry = make_uniq<DbiasmTableEntry>(catalog, *this, info, name, client_);
+    auto *raw = entry.get();
+    tables_[name] = std::move(entry);
+    return raw;
 }
 
 optional_ptr<CatalogEntry> DbiasmSchema::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
@@ -526,14 +561,12 @@ optional_ptr<CatalogEntry> DbiasmSchema::GetEntry(CatalogTransaction transaction
         return nullptr;
     }
 
-    EnsureTablesLoaded();
-
-    auto it = tables_.find(name);
-    if (it == tables_.end()) {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    EnsureNamesLoaded();
+    if (table_names_.find(name) == table_names_.end()) {
         return nullptr;
     }
-
-    return it->second.get();
+    return EnsureTableEntry(name);
 }
 
 void DbiasmSchema::Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
@@ -541,10 +574,11 @@ void DbiasmSchema::Scan(ClientContext &context, CatalogType type, const std::fun
         return;
     }
 
-    EnsureTablesLoaded();
-
-    for (auto &entry : tables_) {
-        callback(*entry.second);
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    EnsureNamesLoaded();
+    for (const auto &name : table_names_) {
+        auto *entry = EnsureTableEntry(name);
+        callback(*entry);
     }
 }
 
@@ -553,10 +587,11 @@ void DbiasmSchema::Scan(CatalogType type, const std::function<void(CatalogEntry 
         return;
     }
 
-    EnsureTablesLoaded();
-
-    for (auto &entry : tables_) {
-        callback(*entry.second);
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    EnsureNamesLoaded();
+    for (const auto &name : table_names_) {
+        auto *entry = EnsureTableEntry(name);
+        callback(*entry);
     }
 }
 

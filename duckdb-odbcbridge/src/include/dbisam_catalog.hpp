@@ -7,7 +7,9 @@
 #include "duckdb/storage/database_size.hpp"
 #include "grpc_client.hpp"
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -57,11 +59,13 @@ public:
 
 private:
     std::shared_ptr<OdbcBridgeClient> client_;
+    std::unordered_set<std::string> table_names_;
     std::unordered_map<std::string, unique_ptr<DbiasmTableEntry>> tables_;
-    bool tables_loaded_ = false;
+    bool names_loaded_ = false;
+    std::mutex cache_mutex_;
 
-    void LoadTables();
-    void EnsureTablesLoaded();
+    void EnsureNamesLoaded();
+    DbiasmTableEntry *EnsureTableEntry(const std::string &name);
 };
 
 // Custom catalog for DBISAM
