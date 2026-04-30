@@ -502,7 +502,7 @@ void DbiasmSchema::EnsureNamesLoaded() {
     }
     auto names = client_->ListTables();
     for (auto &n : names) {
-        table_names_.insert(n);
+        table_names_.emplace(StringUtil::Lower(n), n);
     }
     names_loaded_ = true;
 }
@@ -513,7 +513,12 @@ DbiasmTableEntry *DbiasmSchema::EnsureTableEntry(const std::string &name) {
         return it->second.get();
     }
 
-    auto columns = client_->DescribeTable(name);
+    std::vector<ColumnInfo> columns;
+    try {
+        columns = client_->DescribeTable(name);
+    } catch (...) {
+        return nullptr;
+    }
 
     CreateTableInfo info;
     info.catalog = catalog.GetName();
@@ -543,10 +548,11 @@ optional_ptr<CatalogEntry> DbiasmSchema::LookupEntry(CatalogTransaction transact
     const auto &name = lookup_info.GetEntryName();
     std::lock_guard<std::mutex> lock(cache_mutex_);
     EnsureNamesLoaded();
-    if (table_names_.find(name) == table_names_.end()) {
+    auto it = table_names_.find(StringUtil::Lower(name));
+    if (it == table_names_.end()) {
         return nullptr;
     }
-    return EnsureTableEntry(name);
+    return EnsureTableEntry(it->second);
 }
 
 void DbiasmSchema::Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
@@ -556,9 +562,11 @@ void DbiasmSchema::Scan(ClientContext &context, CatalogType type, const std::fun
 
     std::lock_guard<std::mutex> lock(cache_mutex_);
     EnsureNamesLoaded();
-    for (const auto &name : table_names_) {
-        auto *entry = EnsureTableEntry(name);
-        callback(*entry);
+    for (const auto &kv : table_names_) {
+        auto *entry = EnsureTableEntry(kv.second);
+        if (entry) {
+            callback(*entry);
+        }
     }
 }
 
@@ -569,9 +577,11 @@ void DbiasmSchema::Scan(CatalogType type, const std::function<void(CatalogEntry 
 
     std::lock_guard<std::mutex> lock(cache_mutex_);
     EnsureNamesLoaded();
-    for (const auto &name : table_names_) {
-        auto *entry = EnsureTableEntry(name);
-        callback(*entry);
+    for (const auto &kv : table_names_) {
+        auto *entry = EnsureTableEntry(kv.second);
+        if (entry) {
+            callback(*entry);
+        }
     }
 }
 

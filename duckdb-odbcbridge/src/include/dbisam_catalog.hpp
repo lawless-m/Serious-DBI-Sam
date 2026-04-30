@@ -62,12 +62,15 @@ public:
 
 private:
     std::shared_ptr<OdbcBridgeClient> client_;
-    std::unordered_set<std::string> table_names_;
+    // lowercase -> canonical-case name, for case-insensitive lookup
+    std::unordered_map<std::string, std::string> table_names_;
     std::unordered_map<std::string, unique_ptr<DbiasmTableEntry>> tables_;
     bool names_loaded_ = false;
     std::mutex cache_mutex_;
 
     void EnsureNamesLoaded();
+    // Returns nullptr if the table is in the listing but DescribeTable fails
+    // (e.g. permission-denied tables that the remote refuses to open).
     DbiasmTableEntry *EnsureTableEntry(const std::string &name);
 };
 
