@@ -3,7 +3,7 @@
 #include "type_mapping.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
 
 namespace duckdb {
@@ -80,10 +80,10 @@ static void DbiasmTablesExecute(
     output.SetCardinality(count);
 }
 
-void RegisterDbiasmTablesFunction(DatabaseInstance &db) {
+void RegisterDbiasmTablesFunction(ExtensionLoader &loader) {
     TableFunction func("dbisam_tables", {}, DbiasmTablesExecute, DbiasmTablesBind);
     func.init_global = DbiasmTablesInitGlobal;
-    ExtensionUtil::RegisterFunction(db, func);
+    loader.RegisterFunction(func);
 }
 
 // ============================================
@@ -150,11 +150,11 @@ static void DbiasmDescribeExecute(
     output.SetCardinality(count);
 }
 
-void RegisterDbiasmDescribeFunction(DatabaseInstance &db) {
+void RegisterDbiasmDescribeFunction(ExtensionLoader &loader) {
     TableFunction func("dbisam_describe", {LogicalType::VARCHAR},
                        DbiasmDescribeExecute, DbiasmDescribeBind);
     func.init_global = DbiasmDescribeInitGlobal;
-    ExtensionUtil::RegisterFunction(db, func);
+    loader.RegisterFunction(func);
 }
 
 // ============================================
@@ -261,18 +261,18 @@ static void DbiasmQueryExecute(
     output.SetCardinality(count);
 }
 
-void RegisterDbiasmQueryFunction(DatabaseInstance &db) {
+void RegisterDbiasmQueryFunction(ExtensionLoader &loader) {
     // Version with just SQL
     TableFunction func1("dbisam_query", {LogicalType::VARCHAR},
                         DbiasmQueryExecute, DbiasmQueryBind);
     func1.init_global = DbiasmQueryInitGlobal;
-    ExtensionUtil::RegisterFunction(db, func1);
+    loader.RegisterFunction(func1);
 
     // Version with SQL and limit
     TableFunction func2("dbisam_query", {LogicalType::VARCHAR, LogicalType::INTEGER},
                         DbiasmQueryExecute, DbiasmQueryBind);
     func2.init_global = DbiasmQueryInitGlobal;
-    ExtensionUtil::RegisterFunction(db, func2);
+    loader.RegisterFunction(func2);
 }
 
 } // namespace duckdb

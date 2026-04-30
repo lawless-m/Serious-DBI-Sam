@@ -101,7 +101,7 @@ Value MapProtoValueToDuckDB(const odbcbridge::Value &proto_value,
         }
         if (duckdb_type == LogicalType::TIMESTAMP) {
             try {
-                return Value::TIMESTAMP(Timestamp::FromString(str));
+                return Value::TIMESTAMP(Timestamp::FromString(str, false));
             } catch (...) {
                 return Value(str);
             }

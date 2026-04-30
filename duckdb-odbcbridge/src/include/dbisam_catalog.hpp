@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "grpc_client.hpp"
 #include <memory>
@@ -15,6 +16,7 @@ namespace duckdb {
 
 class DbiasmCatalog;
 class DbiasmSchema;
+class PhysicalPlanGenerator;
 
 // Custom table entry for DBISAM tables
 class DbiasmTableEntry : public TableCatalogEntry {
@@ -39,7 +41,8 @@ public:
                  std::shared_ptr<OdbcBridgeClient> client);
 
     optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override;
-    optional_ptr<CatalogEntry> GetEntry(CatalogTransaction transaction, CatalogType type, const string &name) override;
+    optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction,
+                                           const EntryLookupInfo &lookup_info) override;
     void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
     void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 
@@ -76,18 +79,19 @@ public:
     string GetCatalogType() override { return "dbisam"; }
     void Initialize(bool load_builtin) override;
     void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
-    optional_ptr<SchemaCatalogEntry> GetSchema(CatalogTransaction transaction, const string &schema_name,
-                                               OnEntryNotFound if_not_found, QueryErrorContext error_context = QueryErrorContext()) override;
+    optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction,
+                                                  const EntryLookupInfo &schema_lookup,
+                                                  OnEntryNotFound if_not_found) override;
     optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
     void DropSchema(ClientContext &context, DropInfo &info) override;
-    unique_ptr<PhysicalOperator> PlanCreateTableAs(ClientContext &context, LogicalCreateTable &op,
-                                                    unique_ptr<PhysicalOperator> plan) override;
-    unique_ptr<PhysicalOperator> PlanInsert(ClientContext &context, LogicalInsert &op,
-                                            unique_ptr<PhysicalOperator> plan) override;
-    unique_ptr<PhysicalOperator> PlanDelete(ClientContext &context, LogicalDelete &op,
-                                            unique_ptr<PhysicalOperator> plan) override;
-    unique_ptr<PhysicalOperator> PlanUpdate(ClientContext &context, LogicalUpdate &op,
-                                            unique_ptr<PhysicalOperator> plan) override;
+    PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+                                        LogicalCreateTable &op, PhysicalOperator &plan) override;
+    PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                 optional_ptr<PhysicalOperator> plan) override;
+    PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+                                 PhysicalOperator &plan) override;
+    PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+                                 PhysicalOperator &plan) override;
     unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
                                                  unique_ptr<LogicalOperator> plan) override;
     DatabaseSize GetDatabaseSize(ClientContext &context) override;

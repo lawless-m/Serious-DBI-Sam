@@ -2,13 +2,13 @@
 
 #include "odbcbridge_extension.hpp"
 #include "duckdb.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
 
 namespace duckdb {
 
-static void LoadInternal(DatabaseInstance &instance) {
-    // Register configuration settings
+static void LoadInternal(ExtensionLoader &loader) {
+    auto &instance = loader.GetDatabaseInstance();
     auto &config = DBConfig::GetConfig(instance);
 
     config.AddExtensionOption(
@@ -29,17 +29,15 @@ static void LoadInternal(DatabaseInstance &instance) {
         LogicalType::VARCHAR,
         Value("dbisam"));
 
-    // Register table functions
-    RegisterDbiasmTablesFunction(instance);
-    RegisterDbiasmDescribeFunction(instance);
-    RegisterDbiasmQueryFunction(instance);
+    RegisterDbiasmTablesFunction(loader);
+    RegisterDbiasmDescribeFunction(loader);
+    RegisterDbiasmQueryFunction(loader);
 
-    // Register DBISAM catalog for virtual table access
     RegisterDbiasmCatalog(instance);
 }
 
-void OdbcbridgeExtension::Load(DuckDB &db) {
-    LoadInternal(*db.instance);
+void OdbcbridgeExtension::Load(ExtensionLoader &loader) {
+    LoadInternal(loader);
 }
 
 std::string OdbcbridgeExtension::Name() {
@@ -50,13 +48,8 @@ std::string OdbcbridgeExtension::Name() {
 
 extern "C" {
 
-DUCKDB_EXTENSION_API void odbcbridge_init(duckdb::DatabaseInstance &db) {
-    duckdb::DuckDB db_wrapper(db);
-    db_wrapper.LoadExtension<duckdb::OdbcbridgeExtension>();
-}
-
-DUCKDB_EXTENSION_API const char *odbcbridge_version() {
-    return duckdb::DuckDB::LibraryVersion();
+DUCKDB_CPP_EXTENSION_ENTRY(odbcbridge, loader) {
+    duckdb::LoadInternal(loader);
 }
 
 }

@@ -4,16 +4,18 @@
 
 namespace duckdb {
 
+class ExtensionLoader;
+
 class OdbcbridgeExtension : public Extension {
 public:
-    void Load(DuckDB &db) override;
+    void Load(ExtensionLoader &loader) override;
     std::string Name() override;
 };
 
 // Table function registration
-void RegisterDbiasmTablesFunction(DatabaseInstance &db);
-void RegisterDbiasmDescribeFunction(DatabaseInstance &db);
-void RegisterDbiasmQueryFunction(DatabaseInstance &db);
+void RegisterDbiasmTablesFunction(ExtensionLoader &loader);
+void RegisterDbiasmDescribeFunction(ExtensionLoader &loader);
+void RegisterDbiasmQueryFunction(ExtensionLoader &loader);
 
 // Catalog registration
 void RegisterDbiasmCatalog(DatabaseInstance &db);

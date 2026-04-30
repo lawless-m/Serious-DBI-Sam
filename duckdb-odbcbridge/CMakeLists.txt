@@ -85,7 +85,7 @@ if(NOT DEFINED DUCKDB_DIR)
     FetchContent_Declare(
         duckdb
         GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-        GIT_TAG v1.2.1
+        GIT_TAG v1.5.2
     )
     FetchContent_MakeAvailable(duckdb)
     set(DUCKDB_DIR ${duckdb_SOURCE_DIR})
@@ -126,7 +126,7 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES
 set(NULL_FILE ${duckdb_SOURCE_DIR}/scripts/null.txt)
 
 # Use DuckDB's version - hardcoded to match FetchContent tag
-set(DUCKDB_VERSION_NORMALIZED "v1.2.1")
+set(DUCKDB_VERSION_NORMALIZED "v1.5.2")
 
 # Add metadata to extension (required for DuckDB to load it)
 add_custom_command(

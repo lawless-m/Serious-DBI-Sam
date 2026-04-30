@@ -10,10 +10,6 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -84,7 +80,7 @@ static bool TryConvertFilter(const TableFilter &filter, const string &column_nam
                     op = "=";
                     break;
                 case ExpressionType::COMPARE_NOTEQUAL:
-                    op = "!=";
+                    op = "<>";
                     break;
                 case ExpressionType::COMPARE_LESSTHAN:
                     op = "<";
@@ -175,10 +171,7 @@ struct DbiasmScanBindData : public TableFunctionData {
     vector<string> column_names;
     vector<LogicalType> column_types;
 
-    // Filter pushdown
-    std::string filter_sql;
     std::optional<int32_t> limit;
-    bool has_unpushed_filters = false;
 };
 
 struct DbiasmScanGlobalState : public GlobalTableFunctionState {
@@ -237,12 +230,37 @@ static unique_ptr<GlobalTableFunctionState> DbiasmScanInit(ClientContext &contex
     // Store rowid_scan flag for later use
     state->rowid_scan = rowid_scan;
 
+    // Build WHERE clause from filters DuckDB pushed into the scan.
+    // input.filters is populated AFTER the pushdown_complex_filter optimizer
+    // pass, so we must read it here at scan-init rather than during planning.
+    std::string filter_sql;
+    if (input.filters) {
+        vector<string> conditions;
+        bool warning_issued = false;
+        for (auto &entry : input.filters->filters) {
+            // entry.first is the index INTO input.column_ids, not the table column index.
+            idx_t projected_idx = entry.first;
+            if (projected_idx >= input.column_ids.size()) continue;
+            column_t table_col_idx = input.column_ids[projected_idx];
+            if (table_col_idx == COLUMN_IDENTIFIER_ROW_ID) continue;
+            if (table_col_idx >= bind_data.column_names.size()) continue;
+            string condition;
+            if (TryConvertFilter(*entry.second, "\"" + bind_data.column_names[table_col_idx] + "\"",
+                                 condition, context, warning_issued)) {
+                conditions.push_back(condition);
+            }
+        }
+        if (!conditions.empty()) {
+            filter_sql = StringUtil::Join(conditions, " AND ");
+        }
+    }
+
     // Row-id-only scan (COUNT(*) and friends): replace the full table fetch
     // with a remote COUNT(*) and emit synthetic row-ids locally.
     if (rowid_scan && !bind_data.limit.has_value()) {
         std::string count_sql = "SELECT COUNT(*) FROM " + bind_data.table_name;
-        if (!bind_data.filter_sql.empty()) {
-            count_sql += " WHERE " + bind_data.filter_sql;
+        if (!filter_sql.empty()) {
+            count_sql += " WHERE " + filter_sql;
         }
         auto count_reader = bind_data.client->Query(count_sql, std::nullopt);
         std::vector<std::vector<Value>> rows;
@@ -261,8 +279,8 @@ static unique_ptr<GlobalTableFunctionState> DbiasmScanInit(ClientContext &contex
     }
     sql += " FROM " + bind_data.table_name;
 
-    if (!bind_data.filter_sql.empty()) {
-        sql += " WHERE " + bind_data.filter_sql;
+    if (!filter_sql.empty()) {
+        sql += " WHERE " + filter_sql;
     }
 
     // Store projected columns for result mapping
@@ -272,6 +290,93 @@ static unique_ptr<GlobalTableFunctionState> DbiasmScanInit(ClientContext &contex
     state->reader = bind_data.client->Query(sql, bind_data.limit);
 
     return state;
+}
+
+// Copy `take` rows from batch[batch_offset..) into output column `col` starting at row_offset.
+// Switches on the column's LogicalType once instead of going through Vector::SetValue per cell.
+static void FillColumn(DataChunk &output, idx_t col, idx_t row_offset,
+                       const std::vector<std::vector<Value>> &batch,
+                       idx_t batch_offset, idx_t take) {
+    auto &vec = output.data[col];
+    auto &validity = FlatVector::Validity(vec);
+    // Specialized for column types where wire format == output type. Narrow ints
+    // (SMALLINT/INTEGER/TINYINT) and FLOAT fall through to the generic SetValue
+    // path because the .NET service can deliver them as strings (when GetInt64
+    // throws on narrow ODBC ints), and SetValue handles the string→int cast.
+    switch (vec.GetType().id()) {
+        case LogicalTypeId::BIGINT: {
+            auto data = FlatVector::GetData<int64_t>(vec);
+            for (idx_t i = 0; i < take; i++) {
+                auto &v = batch[batch_offset + i][col];
+                if (v.IsNull()) validity.SetInvalid(row_offset + i);
+                else data[row_offset + i] = BigIntValue::Get(v);
+            }
+            break;
+        }
+        case LogicalTypeId::DOUBLE: {
+            auto data = FlatVector::GetData<double>(vec);
+            for (idx_t i = 0; i < take; i++) {
+                auto &v = batch[batch_offset + i][col];
+                if (v.IsNull()) validity.SetInvalid(row_offset + i);
+                else data[row_offset + i] = DoubleValue::Get(v);
+            }
+            break;
+        }
+        case LogicalTypeId::BOOLEAN: {
+            auto data = FlatVector::GetData<bool>(vec);
+            for (idx_t i = 0; i < take; i++) {
+                auto &v = batch[batch_offset + i][col];
+                if (v.IsNull()) validity.SetInvalid(row_offset + i);
+                else data[row_offset + i] = BooleanValue::Get(v);
+            }
+            break;
+        }
+        case LogicalTypeId::DATE: {
+            auto data = FlatVector::GetData<date_t>(vec);
+            for (idx_t i = 0; i < take; i++) {
+                auto &v = batch[batch_offset + i][col];
+                if (v.IsNull()) validity.SetInvalid(row_offset + i);
+                else data[row_offset + i] = DateValue::Get(v);
+            }
+            break;
+        }
+        case LogicalTypeId::TIME: {
+            auto data = FlatVector::GetData<dtime_t>(vec);
+            for (idx_t i = 0; i < take; i++) {
+                auto &v = batch[batch_offset + i][col];
+                if (v.IsNull()) validity.SetInvalid(row_offset + i);
+                else data[row_offset + i] = TimeValue::Get(v);
+            }
+            break;
+        }
+        case LogicalTypeId::TIMESTAMP: {
+            auto data = FlatVector::GetData<timestamp_t>(vec);
+            for (idx_t i = 0; i < take; i++) {
+                auto &v = batch[batch_offset + i][col];
+                if (v.IsNull()) validity.SetInvalid(row_offset + i);
+                else data[row_offset + i] = TimestampValue::Get(v);
+            }
+            break;
+        }
+        case LogicalTypeId::VARCHAR: {
+            auto data = FlatVector::GetData<string_t>(vec);
+            for (idx_t i = 0; i < take; i++) {
+                auto &v = batch[batch_offset + i][col];
+                if (v.IsNull()) {
+                    validity.SetInvalid(row_offset + i);
+                } else {
+                    data[row_offset + i] = StringVector::AddString(vec, StringValue::Get(v));
+                }
+            }
+            break;
+        }
+        default:
+            // Fallback for any unspecialized types (DECIMAL, BLOB, structured types, ...).
+            for (idx_t i = 0; i < take; i++) {
+                vec.SetValue(row_offset + i, batch[batch_offset + i][col]);
+            }
+            break;
+    }
 }
 
 static void DbiasmScanFunc(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -286,8 +391,9 @@ static void DbiasmScanFunc(ClientContext &context, TableFunctionInput &data, Dat
         idx_t total = static_cast<idx_t>(state.synthetic_count);
         idx_t remaining = total > state.row_id ? total - state.row_id : 0;
         idx_t emit = std::min(remaining, static_cast<idx_t>(STANDARD_VECTOR_SIZE));
+        auto data = FlatVector::GetData<int64_t>(output.data[0]);
         for (idx_t i = 0; i < emit; i++) {
-            output.SetValue(0, i, Value::BIGINT(state.row_id++));
+            data[i] = static_cast<int64_t>(state.row_id++);
         }
         output.SetCardinality(emit);
         if (emit == 0) {
@@ -297,60 +403,36 @@ static void DbiasmScanFunc(ClientContext &context, TableFunctionInput &data, Dat
     }
 
     idx_t count = 0;
+    idx_t num_cols = output.ColumnCount();
     while (count < STANDARD_VECTOR_SIZE) {
-        // Need more rows?
         if (state.batch_offset >= state.current_batch.size()) {
             if (!state.reader->ReadBatch(state.current_batch)) {
                 state.finished = true;
                 break;
             }
             state.batch_offset = 0;
+            if (state.current_batch.empty()) continue;
         }
 
-        // Copy row to output
-        auto &row = state.current_batch[state.batch_offset];
+        idx_t take = std::min(state.current_batch.size() - state.batch_offset,
+                              static_cast<size_t>(STANDARD_VECTOR_SIZE - count));
 
         if (state.rowid_scan) {
-            // For COUNT(*) etc., return row IDs
-            output.SetValue(0, count, Value::BIGINT(state.row_id++));
+            auto data = FlatVector::GetData<int64_t>(output.data[0]);
+            for (idx_t i = 0; i < take; i++) {
+                data[count + i] = static_cast<int64_t>(state.row_id++);
+            }
         } else {
-            // Return actual column data
-            idx_t num_cols = output.ColumnCount();
-            for (idx_t col = 0; col < num_cols && col < row.size(); col++) {
-                output.SetValue(col, count, row[col]);
+            for (idx_t col = 0; col < num_cols; col++) {
+                FillColumn(output, col, count, state.current_batch, state.batch_offset, take);
             }
         }
 
-        state.batch_offset++;
-        count++;
+        state.batch_offset += take;
+        count += take;
     }
 
     output.SetCardinality(count);
-}
-
-static void DbiasmScanPushdownFilter(ClientContext &context, optional_ptr<FunctionData> bind_data_p,
-                                     vector<unique_ptr<Expression>> &filters) {
-    auto &bind_data = bind_data_p->Cast<DbiasmScanBindData>();
-    vector<string> pushed_filters;
-    bool warning_issued = false;
-
-    // Try to push down each filter
-    for (idx_t i = 0; i < filters.size();) {
-        auto &filter = filters[i];
-
-        // Only handle simple column references with table filters
-        if (filter->type == ExpressionType::BOUND_COLUMN_REF) {
-            auto &col_ref = filter->Cast<BoundColumnRefExpression>();
-            idx_t col_idx = col_ref.binding.column_index;
-
-            if (col_idx < bind_data.column_names.size()) {
-                // This is a placeholder - actual filter logic happens in table filter pushdown
-                // Just track that we have filters
-                bind_data.has_unpushed_filters = true;
-            }
-        }
-        i++;
-    }
 }
 
 static unique_ptr<NodeStatistics> DbiasmScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
@@ -358,114 +440,10 @@ static unique_ptr<NodeStatistics> DbiasmScanCardinality(ClientContext &context, 
     return make_uniq<NodeStatistics>();
 }
 
-// Helper to convert expression to SQL
-// column_ids maps from output column index to table column index
-static bool TryConvertExpressionToSQL(const Expression &expr, const vector<string> &column_names,
-                                       const vector<ColumnIndex> &column_ids, string &sql_filter) {
-    if (expr.type == ExpressionType::COMPARE_EQUAL ||
-        expr.type == ExpressionType::COMPARE_NOTEQUAL ||
-        expr.type == ExpressionType::COMPARE_LESSTHAN ||
-        expr.type == ExpressionType::COMPARE_GREATERTHAN ||
-        expr.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
-        expr.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
-
-        auto &comp = expr.Cast<BoundComparisonExpression>();
-        const Expression *col_expr = nullptr;
-        const Expression *const_expr = nullptr;
-
-        // Figure out which side is the column and which is the constant
-        if (comp.left->type == ExpressionType::BOUND_COLUMN_REF &&
-            comp.right->type == ExpressionType::VALUE_CONSTANT) {
-            col_expr = comp.left.get();
-            const_expr = comp.right.get();
-        } else if (comp.right->type == ExpressionType::BOUND_COLUMN_REF &&
-                   comp.left->type == ExpressionType::VALUE_CONSTANT) {
-            col_expr = comp.right.get();
-            const_expr = comp.left.get();
-        } else {
-            return false;
-        }
-
-        auto &col_ref = col_expr->Cast<BoundColumnRefExpression>();
-        auto &const_val = const_expr->Cast<BoundConstantExpression>();
-
-        // col_ref.binding.column_index is the output column index
-        // We need to map it to the table column index via column_ids
-        idx_t output_col_idx = col_ref.binding.column_index;
-        if (output_col_idx >= column_ids.size()) return false;
-
-        idx_t table_col_idx = column_ids[output_col_idx].GetPrimaryIndex();
-        if (table_col_idx >= column_names.size()) return false;
-
-        string op;
-        switch (expr.type) {
-            case ExpressionType::COMPARE_EQUAL: op = "="; break;
-            case ExpressionType::COMPARE_NOTEQUAL: op = "!="; break;
-            case ExpressionType::COMPARE_LESSTHAN: op = "<"; break;
-            case ExpressionType::COMPARE_GREATERTHAN: op = ">"; break;
-            case ExpressionType::COMPARE_LESSTHANOREQUALTO: op = "<="; break;
-            case ExpressionType::COMPARE_GREATERTHANOREQUALTO: op = ">="; break;
-            default: return false;
-        }
-
-        sql_filter = "\"" + column_names[table_col_idx] + "\" " + op + " " + ValueToSQL(const_val.value);
-        return true;
-    }
-    return false;
-}
-
-static void DbiasmScanPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
-                                            vector<unique_ptr<Expression>> &filters) {
-    if (!bind_data_p) {
-        return;
-    }
-    auto &bind_data = bind_data_p->Cast<DbiasmScanBindData>();
-    vector<string> pushed_conditions;
-    bool warning_issued = false;
-
-    // Process table filters (simpler filters that DuckDB pre-processes)
-    if (!get.table_filters.filters.empty()) {
-        for (auto &entry : get.table_filters.filters) {
-            idx_t col_idx = entry.first;
-            auto &filter = *entry.second;
-
-            if (col_idx < bind_data.column_names.size()) {
-                string sql_filter;
-                if (TryConvertFilter(filter, "\"" + bind_data.column_names[col_idx] + "\"", sql_filter, context, warning_issued)) {
-                    pushed_conditions.push_back(sql_filter);
-                } else {
-                    bind_data.has_unpushed_filters = true;
-                }
-            }
-        }
-    }
-
-    // Process expression filters
-    // get.GetColumnIds() maps output column index to table column index
-    auto &column_ids = get.GetColumnIds();
-    for (idx_t i = 0; i < filters.size();) {
-        string sql_filter;
-        if (TryConvertExpressionToSQL(*filters[i], bind_data.column_names, column_ids, sql_filter)) {
-            pushed_conditions.push_back(sql_filter);
-            // Remove the filter since we're handling it
-            filters.erase(filters.begin() + i);
-        } else {
-            bind_data.has_unpushed_filters = true;
-            i++;
-        }
-    }
-
-    // Combine all pushed conditions
-    if (!pushed_conditions.empty()) {
-        bind_data.filter_sql = StringUtil::Join(pushed_conditions, " AND ");
-    }
-}
-
 static TableFunction GetDbiasmScanFunction() {
     TableFunction func("dbisam_scan", {}, DbiasmScanFunc, DbiasmScanBind, DbiasmScanInit);
     func.filter_pushdown = true;
     func.projection_pushdown = true;
-    func.pushdown_complex_filter = DbiasmScanPushdownComplexFilter;
     func.cardinality = DbiasmScanCardinality;
     return func;
 }
@@ -556,11 +534,13 @@ optional_ptr<CatalogEntry> DbiasmSchema::CreateTable(CatalogTransaction transact
     throw NotImplementedException("DBISAM catalog does not support CREATE TABLE");
 }
 
-optional_ptr<CatalogEntry> DbiasmSchema::GetEntry(CatalogTransaction transaction, CatalogType type, const string &name) {
-    if (type != CatalogType::TABLE_ENTRY) {
+optional_ptr<CatalogEntry> DbiasmSchema::LookupEntry(CatalogTransaction transaction,
+                                                     const EntryLookupInfo &lookup_info) {
+    if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
         return nullptr;
     }
 
+    const auto &name = lookup_info.GetEntryName();
     std::lock_guard<std::mutex> lock(cache_mutex_);
     EnsureNamesLoaded();
     if (table_names_.find(name) == table_names_.end()) {
@@ -655,8 +635,10 @@ void DbiasmCatalog::Initialize(bool load_builtin) {
     main_schema_ = make_uniq<DbiasmSchema>(*this, info, client_);
 }
 
-optional_ptr<SchemaCatalogEntry> DbiasmCatalog::GetSchema(CatalogTransaction transaction, const string &schema_name,
-                                                          OnEntryNotFound if_not_found, QueryErrorContext error_context) {
+optional_ptr<SchemaCatalogEntry> DbiasmCatalog::LookupSchema(CatalogTransaction transaction,
+                                                             const EntryLookupInfo &schema_lookup,
+                                                             OnEntryNotFound if_not_found) {
+    const auto &schema_name = schema_lookup.GetEntryName();
     if (schema_name == DEFAULT_SCHEMA) {
         return main_schema_.get();
     }
@@ -668,13 +650,13 @@ optional_ptr<SchemaCatalogEntry> DbiasmCatalog::GetSchema(CatalogTransaction tra
     throw CatalogException("Schema \"%s\" not found in DBISAM catalog", schema_name);
 }
 
-unique_ptr<PhysicalOperator> DbiasmCatalog::PlanCreateTableAs(ClientContext &context, LogicalCreateTable &op,
-                                                               unique_ptr<PhysicalOperator> plan) {
+PhysicalOperator &DbiasmCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                   LogicalCreateTable &op, PhysicalOperator &plan) {
     throw NotImplementedException("DBISAM catalog does not support CREATE TABLE AS");
 }
 
-unique_ptr<PhysicalOperator> DbiasmCatalog::PlanInsert(ClientContext &context, LogicalInsert &op,
-                                                        unique_ptr<PhysicalOperator> plan) {
+PhysicalOperator &DbiasmCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
+                                            LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
     throw NotImplementedException("DBISAM catalog does not support INSERT");
 }
 
@@ -710,13 +692,13 @@ void DbiasmCatalog::DropSchema(ClientContext &context, DropInfo &info) {
     throw NotImplementedException("DBISAM catalog does not support DROP SCHEMA");
 }
 
-unique_ptr<PhysicalOperator> DbiasmCatalog::PlanDelete(ClientContext &context, LogicalDelete &op,
-                                                        unique_ptr<PhysicalOperator> plan) {
+PhysicalOperator &DbiasmCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
+                                            LogicalDelete &op, PhysicalOperator &plan) {
     throw NotImplementedException("DBISAM catalog does not support DELETE");
 }
 
-unique_ptr<PhysicalOperator> DbiasmCatalog::PlanUpdate(ClientContext &context, LogicalUpdate &op,
-                                                        unique_ptr<PhysicalOperator> plan) {
+PhysicalOperator &DbiasmCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
+                                            LogicalUpdate &op, PhysicalOperator &plan) {
     throw NotImplementedException("DBISAM catalog does not support UPDATE");
 }
 
@@ -758,7 +740,7 @@ private:
     vector<unique_ptr<Transaction>> active_transactions;
 };
 
-static unique_ptr<TransactionManager> DbiasmCreateTransactionManager(StorageExtensionInfo *storage_info,
+static unique_ptr<TransactionManager> DbiasmCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
                                                                       AttachedDatabase &db, Catalog &catalog) {
     return make_uniq<DbiasmTransactionManager>(db);
 }
@@ -771,9 +753,9 @@ struct DbiasmStorageExtensionInfo : public StorageExtensionInfo {
     // No additional info needed - connection details come from extension settings
 };
 
-static unique_ptr<Catalog> DbiasmAttach(StorageExtensionInfo *storage_info, ClientContext &context,
+static unique_ptr<Catalog> DbiasmAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                          AttachedDatabase &db, const string &name, AttachInfo &info,
-                                         AccessMode access_mode) {
+                                         AttachOptions &options) {
     // Get connection settings
     std::string host = "localhost";
     int32_t port = 50051;
@@ -806,13 +788,12 @@ static unique_ptr<Catalog> DbiasmAttach(StorageExtensionInfo *storage_info, Clie
 void RegisterDbiasmCatalog(DatabaseInstance &db) {
     auto &config = DBConfig::GetConfig(db);
 
-    // Create and register the storage extension
-    auto storage_ext = make_uniq<StorageExtension>();
+    auto storage_ext = make_shared_ptr<StorageExtension>();
     storage_ext->attach = DbiasmAttach;
     storage_ext->create_transaction_manager = DbiasmCreateTransactionManager;
     storage_ext->storage_info = make_shared_ptr<DbiasmStorageExtensionInfo>();
 
-    config.storage_extensions["odbcbridge"] = std::move(storage_ext);
+    StorageExtension::Register(config, "odbcbridge", std::move(storage_ext));
 }
 
 } // namespace duckdb
